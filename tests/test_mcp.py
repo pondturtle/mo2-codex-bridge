@@ -14,7 +14,7 @@ class MCPTests(unittest.TestCase):
             {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
             {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'mo2_change', 'arguments': {'action': 'install_archive', 'params': {}}}},
             {'jsonrpc': '2.0', 'id': 4, 'method': 'ping'}]
-        result = subprocess.run([sys.executable, str(server)], input='\n'.join(json.dumps(x) for x in messages) + '\n', capture_output=True, text=True, timeout=10)
+        result = subprocess.run([sys.executable, str(server)], input='\n'.join(json.dumps(x) for x in messages) + '\n', capture_output=True, text=True, timeout=10, executable=sys.executable)
         self.assertEqual(result.returncode, 0, result.stderr)
         replies = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(len(replies), 4)

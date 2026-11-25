@@ -51,6 +51,12 @@ class ModList:
         self.mods = {n: Mod(root, n) for n in ['A', 'B']}
         self.order = list(self.mods)
         self.active = {'A', 'B'}
+        self.profile = root.parent / 'profile'
+        self.defer_save = False
+        self.write_files()
+    def write_files(self):
+        (self.profile / 'modlist.txt').write_text('# MO2\n' + '\n'.join(
+            ('+' if n in self.active else '-') + n for n in reversed(self.order)) + '\n', encoding='utf-8')
     def allModsByProfilePriority(self): return self.order
     def allMods(self): return self.order + ['Overwrite']
     def getMod(self, name): return self.mods.get(name)
@@ -60,9 +66,11 @@ class ModList:
     def setPriority(self, name, priority):
         self.order.remove(name)
         self.order.insert(priority, name)
+        if not self.defer_save: self.write_files()
         return True
     def setActive(self, name, value):
         self.active.add(name) if value else self.active.discard(name)
+        if not self.defer_save: self.write_files()
         return True
     def removeMod(self, mod):
         path = Path(mod.absolutePath())
@@ -72,16 +80,23 @@ class ModList:
         self.order.remove(mod.name())
         self.mods.pop(mod.name())
         self.active.discard(mod.name())
+        if not self.defer_save: self.write_files()
         return True
 
 
 class Plugins:
-    def __init__(self):
+    def __init__(self, profile):
+        self.profile = profile
         self.order = ['Master.esm', 'Child.esp']
         self.active = set(self.order)
-    def pluginNames(self): return self.order
+        self.commit_calls = []
+        self.defer_save = False
+        self.derived = {}
+        self.refresh_indexes()
+        self.write_files()
+    def pluginNames(self): return list(self.order)
     def priority(self, name): return self.order.index(name)
-    def loadOrder(self, name): return self.order.index(name) if name in self.active else -1
+    def loadOrder(self, name): return self.derived.get(name, -1)
     def state(self, name): return PluginState.ACTIVE if name in self.active else PluginState.INACTIVE
     def origin(self, name): return 'A'
     def masters(self, name): return ['Master.esm'] if name == 'Child.esp' else []
@@ -89,9 +104,24 @@ class Plugins:
     def hasLightExtension(self, name): return False
     def isMasterFlagged(self, name): return name.endswith('.esm')
     def hasMasterExtension(self, name): return name.endswith('.esm')
+    # Model the actual v2.5.2 API bug: these do not update derived indexes or files.
     def setLoadOrder(self, order): self.order = list(order)
     def setState(self, name, state):
         self.active.add(name) if state == PluginState.ACTIVE else self.active.discard(name)
+    def refresh_indexes(self):
+        self.derived = {n: i for i, n in enumerate(n for n in self.order if n in self.active)}
+    def setPriority(self, name, priority):
+        self.commit_calls.append((name, priority))
+        self.order.remove(name)
+        self.order.insert(priority, name)
+        self.refresh_indexes()
+        if not self.defer_save:
+            self.write_files()
+        return True
+    def write_files(self):
+        (self.profile / 'loadorder.txt').write_text('# MO2\n' + '\n'.join(self.order) + '\n', encoding='utf-8')
+        (self.profile / 'plugins.txt').write_text('# MO2\n' + '\n'.join(
+            ('*' if n in self.active else '') + n for n in self.order if n != 'Master.esm') + '\n', encoding='utf-8')
 
 
 class Organizer:
@@ -99,7 +129,9 @@ class Organizer:
         self.root = root
         for n in ['mods', 'downloads', 'profile', 'overwrite']:
             (root / n).mkdir()
-        self.ml, self.pl = ModList(root / 'mods'), Plugins()
+        self.ml, self.pl = ModList(root / 'mods'), Plugins(root / 'profile')
+    def managedGame(self):
+        return types.SimpleNamespace(gameShortName=lambda: 'SkyrimSE', primaryPlugins=lambda: ['Master.esm'])
     def modList(self): return self.ml
     def pluginList(self): return self.pl
     def modsPath(self): return str(self.root / 'mods')
@@ -110,12 +142,13 @@ class Organizer:
     def appVersion(self): return Version()
     def profile(self): return self
     def localSettingsEnabled(self): return True
-    def getFileOrigins(self, path): return ['A', 'B']
+    def getFileOrigins(self, path): return ['A'] if Path(path).suffix.lower() in {'.esp', '.esm', '.esl'} else ['A', 'B']
     def resolvePath(self, path): return str(self.root / 'mods' / 'B' / path)
     def createMod(self, name):
         mod = Mod(self.root / 'mods', name)
         self.ml.mods[name] = mod
         self.ml.order.append(name)
+        if not self.ml.defer_save: self.ml.write_files()
         return mod
 
 
@@ -124,7 +157,7 @@ class BridgeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.organizer = Organizer(self.root)
-        self.ops = Operations(self.organizer, types.SimpleNamespace(ModState=ModState, PluginState=PluginState, GuessedString=str), self.root / 'data', lambda: None)
+        self.ops = Operations(self.organizer, types.SimpleNamespace(ModState=ModState, PluginState=PluginState, GuessedString=str), self.root / 'data', lambda: None, wait_until=lambda check, timeout: check())
     def tearDown(self):
         self.temporary.cleanup()
     def change(self, action, **params):
@@ -199,12 +232,12 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(report['origins_in_priority_order'], ['A', 'B'])
         self.assertIn('/B/', report['winning_physical_path'].replace('\\', '/'))
     def test_removal_preserves_complete_mod_folder(self):
-        path = self.root / 'mods/A/options.ini'
+        path = self.root / 'mods/B/options.ini'
         path.write_bytes(b'irreplaceable user configuration')
         with self.assertRaisesRegex(ValueError, 'every profile'):
-            self.change('remove_mod', mod='A')
+            self.change('remove_mod', mod='B')
         self.assertTrue(path.exists())
-        result = self.change('remove_mod', mod='A', acknowledge_shared_folder=True)
+        result = self.change('remove_mod', mod='B', acknowledge_shared_folder=True)
         self.assertFalse(path.exists())
         self.assertEqual((Path(result['mod_files_backup']) / 'options.ini').read_bytes(), b'irreplaceable user configuration')
     def test_separator_removal_refreshes_live_model(self):

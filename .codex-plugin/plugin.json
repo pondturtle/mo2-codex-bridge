@@ -1,0 +1,19 @@
+{
+  "name": "mo2-codex-bridge",
+  "version": "0.1.3-local.4-candidate.1",
+  "description": "Manage a running local Mod Organizer 2 through its plugin interface.",
+  "author": {
+    "name": "Project contributors"
+  },
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MO2 Codex Bridge",
+    "shortDescription": "Manage the running MO2",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ]
+  }
+}

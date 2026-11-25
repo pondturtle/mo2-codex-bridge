@@ -6,7 +6,7 @@ import re
 import tempfile
 from pathlib import Path
 
-VERSION = '0.1.0'
+VERSION = '0.1.3-local.4-candidate.1'
 TEXT_EXTENSIONS = {'.ini', '.json', '.toml', '.xml', '.txt', '.yaml', '.yml', '.cfg'}
 PROTECTED = {'meta.ini', 'modlist.txt', 'plugins.txt', 'loadorder.txt', 'archives.txt',
              'lockedorder.txt', 'settings.ini', 'modorganizer.ini'}
@@ -16,7 +16,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def atomic_write(path, data):
+def atomic_write(path, data, *, before_replace=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='.bridge-', dir=str(path.parent))
@@ -25,6 +25,8 @@ def atomic_write(path, data):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):

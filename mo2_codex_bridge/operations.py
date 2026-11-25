@@ -7,9 +7,20 @@ import uuid
 from pathlib import Path
 
 from .common import VERSION, atomic_write, contained_path, digest, safe_name, write_json
+from .persistence import PluginPersistence
+from .configuration_encoding import decode_configuration
+from .managed_operations import (create_separator as create_managed_separator,
+    install_archive as install_managed_archive, update_archive as update_managed_archive,
+    remove_mod as remove_managed_mod, validate_archive)
+from .config_recovery import write_configuration, restore_configuration
+from .order_recovery import read_order_backup, build_restore_plan, revalidate_restore_plan, verify_restore_result, recovery_context
+from .mod_persistence import ModListPersistence
+from .native_backups import browse_native_mod_backups
+from .profile_usage import report_mod_profile_usage
 
 READ_ACTIONS = {'status', 'snapshot', 'downloads', 'file_conflict', 'mod_conflicts',
-                'read_config', 'diagnostics', 'backups', 'logs', 'api_capabilities', 'profiles'}
+                'read_config', 'diagnostics', 'backups', 'logs', 'api_capabilities', 'profiles',
+                'native_mod_backups', 'mod_profile_usage'}
 WRITE_ACTIONS = {'create_separator', 'set_mod_priority', 'set_mod_active', 'set_plugin_active',
                  'set_plugin_order', 'install_archive', 'update_archive', 'write_config',
                  'restore_config', 'hide_file', 'unhide_file', 'restore_order', 'remove_empty_separator',
@@ -17,11 +28,12 @@ WRITE_ACTIONS = {'create_separator', 'set_mod_priority', 'set_mod_active', 'set_
 
 
 class Operations:
-    def __init__(self, organizer, mobase, data_path, refresh, select_profile=None):
+    def __init__(self, organizer, mobase, data_path, refresh, select_profile=None, wait_until=None):
         self.o, self.m = organizer, mobase
         self.data = Path(data_path)
         self.refresh = refresh
         self.profile_selector = select_profile
+        self.wait_until = wait_until
         self.running = set()
 
     def is_active(self, name):
@@ -65,42 +77,101 @@ class Operations:
                   'profile': self.o.profileName(), 'profile_path': self.o.profilePath(),
                   'paths': {'mods': self.o.modsPath(), 'downloads': self.o.downloadsPath(),
                             'overwrite': self.o.overwritePath()}, 'mods': mods, 'plugins': plugins,
-                  'running_applications': sorted(self.running)}
+                  'running_applications': sorted(self.running),
+                  'recovery_identity': {'bridge_data_path': str(self.data.resolve()),
+                                        'game': self.o.managedGame().gameShortName()}}
         result['revision'] = digest(json.dumps(result, sort_keys=True).encode())
         return result
 
     def dispatch(self, action, p):
-        if action not in READ_ACTIONS | WRITE_ACTIONS:
-            raise ValueError('Unknown action: ' + action)
-        if not isinstance(p, dict):
-            raise ValueError('Parameters must be a JSON object')
         backup = None
-        if action in WRITE_ACTIONS:
-            before = self.snapshot()
-            if p.get('expected_profile') != before['profile'] or p.get('expected_revision') != before['revision']:
-                raise ValueError('Profile or state changed. Read snapshot again before making changes.')
-            if self.running:
-                raise ValueError('Close the game or running MO2-launched tools before changing mods')
-            backup = self.data / 'backups' / (time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
-            backup.mkdir(parents=True)
-            write_json(backup / 'before.json', before)
+        backup_created = False
+        operation_entered = False
+        phase = 'preflight'
+        result = None
+        mutating = isinstance(action, str) and action in WRITE_ACTIONS
         try:
+            if action not in READ_ACTIONS | WRITE_ACTIONS:
+                raise ValueError('Unknown action: ' + str(action))
+            if not isinstance(p, dict):
+                raise ValueError('Parameters must be a JSON object')
+            if mutating:
+                before = self.snapshot()
+                if p.get('expected_profile') != before['profile'] or p.get('expected_revision') != before['revision']:
+                    raise ValueError('Profile or state changed. Read snapshot again before making changes.')
+                if self.running:
+                    raise ValueError('Close the game or running MO2-launched tools before changing mods')
+                phase = 'backup'
+                backup = self.data / 'backups' / (time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+                backup.mkdir(parents=True)
+                backup_created = True
+                write_json(backup / 'before.json', before)
+            phase = 'operation'
+            operation_entered = True
             result = self.snapshot() if action == 'snapshot' else getattr(self, action)(p, backup)
             if backup is not None:
-                write_json(backup / 'result.json', {'action': action, 'result': result})
+                phase = 'result_record'
                 result['backup_id'] = backup.name
+                write_json(backup / 'result.json', {'action': action, 'result': result})
             return result
         except Exception as error:
-            if backup is not None:
-                write_json(backup / 'error.json', {'action': action, 'error': str(error)})
+            # Preserve the original exception type for existing callers/tests.
+            # Unknown partial outcomes must never be presented as safe retries.
+            inherited = getattr(error, 'bridge_failure', {})
+            failure = dict(inherited) if isinstance(inherited, dict) else {}
+            recovery = getattr(error, 'recovery_details', None)
+            if isinstance(recovery, dict):
+                failure['recovery_details'] = recovery
+                if type(recovery.get('changes_may_have_occurred')) is bool:
+                    failure.setdefault('changes_may_have_occurred', recovery['changes_may_have_occurred'])
+            failure.setdefault('message', str(error))
+            failure.setdefault('error_type', type(error).__name__)
+            failure.setdefault('action', action if isinstance(action, str) else None)
+            failure.setdefault('phase', phase)
+            failure.setdefault('changes_may_have_occurred', bool(mutating and operation_entered))
+            if backup_created:
+                failure['backup_id'] = backup.name
+            if result is not None and phase == 'result_record':
+                failure['completed_result'] = result
+            if failure['changes_may_have_occurred']:
+                try:
+                    observed = self.snapshot()
+                    failure['observed_state'] = {key: observed[key] for key in ('profile', 'profile_path', 'revision')}
+                except Exception as observation_error:
+                    failure['observation_error'] = str(observation_error)
+            if backup_created:
+                try:
+                    write_json(backup / 'error.json', failure)
+                    failure['error_recorded'] = True
+                except Exception as record_error:
+                    # A full disk or failed backup write must not mask the cause.
+                    failure['error_recorded'] = False
+                    failure['error_record_error'] = str(record_error)
+            error.bridge_failure = failure
             raise
 
     def status(self, p, b):
-        return {'bridge_version': VERSION, 'profile': self.o.profileName(), 'running_applications': sorted(self.running)}
+        result = {'bridge_version': VERSION, 'profile': self.o.profileName(), 'running_applications': sorted(self.running)}
+        if callable(getattr(self.running, 'describe', None)):
+            result['running_application_tracking'] = self.running.describe()
+        if callable(getattr(self, 'job_retention', None)):
+            result['job_retention'] = self.job_retention()
+        return result
 
     def api_capabilities(self, p, b):
-        return {'read_actions': sorted(READ_ACTIONS), 'write_actions': sorted(WRITE_ACTIONS),
-                'organizer_methods': [x for x in dir(self.o) if not x.startswith('_')]}
+        result = {'read_actions': sorted(READ_ACTIONS), 'write_actions': sorted(WRITE_ACTIONS),
+                  'organizer_methods': [x for x in dir(self.o) if not x.startswith('_')]}
+        if callable(getattr(self.running, 'describe', None)):
+            result['running_application_tracking'] = self.running.describe()
+        if callable(getattr(self, 'job_retention', None)):
+            result['job_retention'] = self.job_retention()
+        return result
+
+    def native_mod_backups(self, p, b):
+        return browse_native_mod_backups(self.o, p)
+
+    def mod_profile_usage(self, p, b):
+        return report_mod_profile_usage(self, p)
 
     def profiles(self, p, b):
         root = Path(self.o.profilePath()).parent
@@ -136,8 +207,12 @@ class Operations:
     def mod_conflicts(self, p, b):
         mod = self.mod(p['mod'])
         root = Path(mod.absolutePath())
-        maximum = max(1, min(2000, int(p.get('max_files', 300))))
-        cursor = max(0, int(p.get('offset', 0)))
+        maximum = p.get('max_files', 300)
+        cursor = p.get('offset', 0)
+        if type(maximum) is not int or not 1 <= maximum <= 2000:
+            raise ValueError('max_files must be an integer from 1 through 2000')
+        if type(cursor) is not int or cursor < 0:
+            raise ValueError('offset must be a nonnegative integer')
         files = []
         visited = 0
         more = False
@@ -161,7 +236,7 @@ class Operations:
                 visited += 1
             if more:
                 break
-        return {'mod': p['mod'], 'conflicts': files, 'scanned': visited - cursor,
+        return {'mod': p['mod'], 'conflicts': files, 'scanned': max(0, visited - cursor),
                 'next_offset': visited if more else None,
                 'scope': 'Files physically present in this mod, inspected through MO2 VFS; archive contents not enumerated'}
 
@@ -190,40 +265,10 @@ class Operations:
         if path.stat().st_size > 1024 * 1024:
             raise ValueError('Configuration file exceeds the 1 MiB limit')
         content = path.read_bytes()
-        encoding = 'utf-16' if content.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
-        try:
-            text = content.decode(encoding)
-        except UnicodeError:
-            encoding = 'cp1252'
-            text = content.decode(encoding)
-        return {'path': str(path), 'exists': True, 'sha256': digest(content), 'text': text, 'encoding': encoding}
+        return {'path': str(path), 'exists': True, 'sha256': digest(content), **decode_configuration(content)}
 
     def write_config(self, p, b):
-        path = self.config_path(p)
-        old = path.read_bytes() if path.exists() else None
-        if p.get('expected_sha256') != (digest(old) if old is not None else None):
-            raise ValueError('Configuration file changed. Read it again before writing.')
-        encoding = p.get('encoding', 'utf-8')
-        if encoding not in {'utf-8', 'utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'cp1252'}:
-            raise ValueError('Unsupported text encoding')
-        text = p['text']
-        if not isinstance(text, str) or '\x00' in text:
-            raise ValueError('Text must be a string without null characters')
-        if path.suffix.lower() == '.json':
-            json.loads(text)
-        new = text.encode(encoding)
-        if len(new) > 1024 * 1024:
-            raise ValueError('Configuration file exceeds the 1 MiB limit')
-        if old is not None:
-            atomic_write(b / 'config-before.bin', old)
-        write_json(b / 'config.json', {'scope': p.get('scope', 'mod'), 'mod': p.get('mod'),
-                                     'path': p['path'], 'existed': old is not None,
-                                     'before_sha256': digest(old) if old is not None else None,
-                                     'after_sha256': digest(new)})
-        atomic_write(path, new)
-        if old is None:
-            self.refresh()
-        return {'path': str(path), 'sha256': digest(new), 'bytes': len(new)}
+        return write_configuration(self, p, b)
 
     def get_backup(self, name):
         name = safe_name(name)
@@ -233,39 +278,14 @@ class Operations:
         return path
 
     def restore_config(self, p, b):
-        source = self.get_backup(p['backup_id'])
-        manifest = json.loads((source / 'config.json').read_text(encoding='utf-8'))
-        path = self.config_path(manifest)
-        current = path.read_bytes() if path.exists() else None
-        if current is None or digest(current) != manifest['after_sha256']:
-            raise ValueError('File changed since this backup; restore would overwrite later work')
-        atomic_write(b / 'config-before.bin', current)
-        if manifest['existed']:
-            atomic_write(path, (source / 'config-before.bin').read_bytes())
-        else:
-            path.unlink()
-        return {'restored': str(path), 'source_backup': source.name}
+        return restore_configuration(self, p, b)
 
     def create_separator(self, p, b):
-        name = safe_name(p['name'])
-        if not name.endswith('_separator'):
-            name += '_separator'
-        if self.o.modList().getMod(name) is not None or (Path(self.o.modsPath()) / name).exists():
-            raise ValueError('A mod or separator with this name already exists')
-        created = self.o.createMod(self.m.GuessedString(name))
-        if created is None:
-            raise RuntimeError('MO2 did not create the separator')
-        self.refresh()
-        created = self.mod(name)
-        if not created.isSeparator():
-            raise RuntimeError('MO2 did not recognize the new folder as a separator')
-        if 'priority' in p:
-            self.move_mod(name, p['priority'])
-        return {'name': name, 'priority': self.o.modList().priority(name), 'separator': True}
+        return create_managed_separator(self, p, b)
 
     def move_mod(self, name, priority):
         self.mod(name, writable=True)
-        maximum = len(self.o.modList().allMods()) - 2  # overwrite is not movable
+        maximum = len(self.o.modList().allModsByProfilePriority()) - 1  # backups/Overwrite are automatic
         if type(priority) is not int or not 0 <= priority <= maximum:
             raise ValueError('Priority must be an integer within the movable list')
         if not self.o.modList().setPriority(name, priority):
@@ -286,82 +306,63 @@ class Operations:
             raise RuntimeError('MO2 did not apply the requested enabled state')
         return {'mod': p['mod'], 'active': self.is_active(p['mod'])}
 
+    def plugin_state(self):
+        pl = self.o.pluginList()
+        return {n: pl.state(n) == self.m.PluginState.ACTIVE for n in pl.pluginNames()}
+
     def set_plugin_active(self, p, b):
         pl = self.o.pluginList()
         name = p['plugin']
         if name not in pl.pluginNames() or type(p['active']) is not bool:
             raise ValueError('Specify an existing plugin and a boolean active value')
+        names = {n.casefold(): n for n in pl.pluginNames()}
         if p['active']:
-            inactive = [master for master in pl.masters(name) if pl.state(master) != self.m.PluginState.ACTIVE]
+            inactive = [master for master in pl.masters(name)
+                        if master.casefold() not in names
+                        or pl.state(names[master.casefold()]) != self.m.PluginState.ACTIVE]
             if inactive:
                 raise ValueError('Enable required masters first: ' + ', '.join(inactive))
         else:
-            dependents = [n for n in pl.pluginNames() if pl.state(n) == self.m.PluginState.ACTIVE and name in pl.masters(n)]
+            dependents = [n for n in pl.pluginNames() if pl.state(n) == self.m.PluginState.ACTIVE
+                          and name.casefold() in {m.casefold() for m in pl.masters(n)}]
             if dependents:
                 raise ValueError('Disable dependent plugins first: ' + ', '.join(dependents))
+        commit = PluginPersistence(self.o, self.m, self.wait_until)
+        if not p['active'] and name.casefold() in commit.primary:
+            raise ValueError('Primary game plugins cannot be disabled')
+        order = sorted(pl.pluginNames(), key=pl.priority)
+        states = self.plugin_state()
+        states[name] = p['active']
         pl.setState(name, self.m.PluginState.ACTIVE if p['active'] else self.m.PluginState.INACTIVE)
-        actual = pl.state(name) == self.m.PluginState.ACTIVE
-        if actual != p['active']:
-            raise RuntimeError('MO2 rejected the plugin enabled state (possibly an essential master)')
-        return {'plugin': name, 'active': actual}
+        persistence = commit.commit(order, states)
+        return {'plugin': name, 'active': p['active'], **persistence}
 
     def set_plugin_order(self, p, b):
         pl = self.o.pluginList()
         order = p['plugins']
-        if not isinstance(order, list) or len(order) != len(set(order)) or set(order) != set(pl.pluginNames()):
+        if (not isinstance(order, list) or any(not isinstance(n, str) for n in order)
+                or len(order) != len(set(order)) or set(order) != set(pl.pluginNames())):
             raise ValueError('Supply every currently visible plugin exactly once')
-        positions = {name: i for i, name in enumerate(order)}
+        positions = {name.casefold(): i for i, name in enumerate(order)}
         for name in order:
-            if any(master in positions and positions[master] > positions[name] for master in pl.masters(name)):
+            if any(master.casefold() in positions and positions[master.casefold()] > positions[name.casefold()]
+                   for master in pl.masters(name)):
                 raise ValueError('A master must load before its dependent: ' + name)
+        commit = PluginPersistence(self.o, self.m, self.wait_until)
+        states = self.plugin_state()
         pl.setLoadOrder(order)
-        actual = sorted(pl.pluginNames(), key=pl.priority)
-        return {'requested': order, 'actual': actual, 'exact_match': order == actual}
+        persistence = commit.commit(order, states)
+        return {'requested': order, 'actual': sorted(pl.pluginNames(), key=pl.priority),
+                'exact_match': True, **persistence}
 
     def archive(self, p):
-        path = Path(p['archive']).resolve()
-        if not path.is_file() or path.suffix.lower() not in {'.zip', '.7z', '.rar', '.omod', '.fomod'}:
-            raise ValueError('Specify an existing local mod archive')
-        # An archive path can be outside Downloads, as with user-provided E: files.
-        return path
+        return validate_archive(p['archive'])
 
     def install_archive(self, p, b):
-        name = safe_name(p['name'])
-        if self.o.modList().getMod(name) is not None or (Path(self.o.modsPath()) / name).exists():
-            raise ValueError('Use a new name; this tool will not silently merge or replace existing mods')
-        archive = self.archive(p)
-        created = self.o.installMod(str(archive), name)
-        if created is None:
-            return {'installed': False, 'reason': 'Installer canceled or failed'}
-        installed_name = created.name()
-        self.refresh()
-        if p.get('active') is True:
-            self.o.modList().setActive(installed_name, True)
-            self.refresh()
-        if 'priority' in p:
-            self.move_mod(installed_name, p['priority'])
-        return {'installed': True, 'name': installed_name, 'active': self.is_active(installed_name),
-                'priority': self.o.modList().priority(installed_name)}
+        return install_managed_archive(self, p, b)
 
     def update_archive(self, p, b):
-        old = self.mod(p['mod'], writable=True)
-        if old.isSeparator():
-            raise ValueError('Separators cannot be updated from an archive')
-        before_priority = self.o.modList().priority(p['mod'])
-        before_active = self.is_active(p['mod'])
-        options = dict(p, active=False)
-        result = self.install_archive(options, b)
-        if not result['installed']:
-            return result
-        if p.get('activate_update', False):
-            self.o.modList().setActive(p['mod'], False)
-            self.o.modList().setActive(result['name'], before_active)
-            self.refresh()
-            self.move_mod(result['name'], before_priority)
-        result.update({'previous_mod': p['mod'], 'previous_mod_preserved': True,
-                       'update_activated': bool(p.get('activate_update', False)),
-                       'scope': 'New version installed separately; enabled-state changes affect only the current profile'})
-        return result
+        return update_managed_archive(self, p, b)
 
     def hide_file(self, p, b):
         mod = self.mod(p['mod'], writable=True)
@@ -390,32 +391,79 @@ class Operations:
         return {'backup_ids': sorted((x.name for x in root.iterdir() if x.is_dir()), reverse=True) if root.exists() else []}
 
     def restore_order(self, p, b):
-        source = self.get_backup(p['backup_id'])
-        before = json.loads((source / 'before.json').read_text(encoding='utf-8'))
-        current = self.snapshot()
-        if before['profile'] != current['profile']:
-            raise ValueError('The backup belongs to another profile')
-        managed = [x for x in before['mods'] if not x['foreign'] and not x['overwrite']]
-        current_names = {x['name'] for x in current['mods']}
-        if any(x['name'] not in current_names for x in managed):
-            raise ValueError('Backup refers to removed mods; restore them first')
-        for mod in sorted(managed, key=lambda x: x['priority']):
-            self.move_mod(mod['name'], mod['priority'])
-            if not mod['separator']:
-                self.o.modList().setActive(mod['name'], mod['active'])
-        extra = [x for x in current['mods'] if x['name'] not in {y['name'] for y in before['mods']} and not x['foreign'] and not x['overwrite'] and not x['separator']]
-        for mod in extra:
-            self.o.modList().setActive(mod['name'], False)
-        self.refresh()
-        pl = self.o.pluginList()
-        order = [x['name'] for x in before['plugins'] if x['name'] in pl.pluginNames()]
-        order += [n for n in pl.pluginNames() if n not in order]
-        pl.setLoadOrder(order)
-        for plugin in before['plugins']:
-            if plugin['name'] in pl.pluginNames():
-                pl.setState(plugin['name'], self.m.PluginState.ACTIVE if plugin['active'] else self.m.PluginState.INACTIVE)
-        return {'restored_profile_order': before['profile'], 'extra_mods_disabled': [x['name'] for x in extra],
-                'scope': 'Priorities and enabled states only; mod files and removed mods are not restored'}
+        progress = {'stage': 'restore-preflight', 'changes_may_have_occurred': False,
+                    'completed_steps': []}
+        try:
+            source = self.get_backup(p['backup_id'])
+            before = read_order_backup(source)
+            current = self.snapshot()
+            primary = list(self.o.managedGame().primaryPlugins())
+            # Both save verifiers must be available BEFORE any mutation.
+            PluginPersistence(self.o, self.m, self.wait_until)
+            mod_save = ModListPersistence(self.o, self.wait_until)
+            plan = build_restore_plan(before, current, primary,
+                                      plugin_origins=self.o.getFileOrigins)
+
+            def guard_context():
+                if recovery_context(self.snapshot()) != plan['context']:
+                    raise RuntimeError('Profile or physical context changed during restore; no further setters applied')
+                if self.running:
+                    raise RuntimeError('A game or MO2 tool started during restore; no further setters applied')
+
+            for name, priority in plan['mod_moves']:
+                guard_context()
+                progress.update(stage='restore-mod-priority', changes_may_have_occurred=True)
+                self.move_mod(name, priority)
+                progress['completed_steps'].append({'mod': name, 'priority': priority})
+            for name, active in plan['mod_states']:
+                guard_context()
+                progress.update(stage='restore-mod-state', changes_may_have_occurred=True)
+                self.o.modList().setActive(name, active)
+                progress['completed_steps'].append({'mod': name, 'active': active})
+            if plan['mod_moves'] or plan['mod_states']:
+                progress['stage'] = 'restore-mod-refresh'
+                self.refresh()
+            progress['stage'] = 'restore-revalidate'
+            guard_context()
+            revalidate_restore_plan(plan, self.snapshot(),
+                plugin_origins=self.o.getFileOrigins,
+                primary_plugins=list(self.o.managedGame().primaryPlugins()))
+            commit = PluginPersistence(self.o, self.m, self.wait_until)
+            pl = self.o.pluginList()
+            guard_context()
+            progress.update(stage='restore-plugin-state', changes_may_have_occurred=True)
+            pl.setLoadOrder(plan['order'])
+            for name in plan['order']:
+                guard_context()
+                pl.setState(name, self.m.PluginState.ACTIVE if plan['states'][name]
+                            else self.m.PluginState.INACTIVE)
+            progress['completed_steps'].append({'plugin_order_and_states_applied': True})
+            progress['stage'] = 'verify-plugin-save'
+            guard_context()
+            persistence = commit.commit(plan['order'], plan['states'])
+
+            def check_final():
+                guard_context()
+                verify_restore_result(plan, self.snapshot(),
+                    plugin_origins=self.o.getFileOrigins,
+                    primary_plugins=list(self.o.managedGame().primaryPlugins()))
+                matches, why = commit.saved_matches(plan['order'], plan['states'])
+                if not matches:
+                    raise RuntimeError('Saved plugin files changed during final restore verification: ' + why)
+
+            progress['stage'] = 'verify-mod-save'
+            final_snapshot = self.snapshot()
+            check_final()
+            mod_persistence = mod_save.verify(final_snapshot['mods'], check_final)
+            check_final()
+            return {**persistence, **mod_persistence,
+                    'verified_files': persistence['verified_files'] + ['modlist.txt'],
+                    'restored_profile_order': before['profile'],
+                    'extra_mods_disabled': plan['extra_mods_disabled'],
+                    'scope': 'Priorities and enabled states only; mod files and removed mods are not restored'}
+        except Exception as error:
+            error.recovery_details = {**progress, 'automatic_rollback_attempted': False}
+            raise
 
     def remove_empty_separator(self, p, b):
         mod = self.mod(p['mod'], writable=True)
@@ -429,39 +477,20 @@ class Operations:
         return {'removed': bool(removed), 'name': p['mod']}
 
     def remove_mod(self, p, b):
-        mod = self.mod(p['mod'], writable=True)
-        if mod.isSeparator():
-            raise ValueError('Use remove_empty_separator for a separator')
-        if p.get('acknowledge_shared_folder') is not True:
-            raise ValueError('Removing a mod affects every profile. Explicitly acknowledge_shared_folder=true.')
-        root = Path(mod.absolutePath())
-        total = 0
-        for folder, dirs, files in os.walk(root, followlinks=False):
-            for name in dirs + files:
-                entry = Path(folder) / name
-                if entry.is_symlink() or (hasattr(entry, 'is_junction') and entry.is_junction()):
-                    raise ValueError('Mod contains links or junctions; removal refused')
-            total += sum((Path(folder) / name).stat().st_size for name in files)
-        if shutil.disk_usage(b).free < total + 64 * 1024 * 1024:
-            raise ValueError('Not enough space to preserve the mod before removal')
-        shutil.copytree(root, b / 'removed-mod')
-        removed = self.o.modList().removeMod(mod)
-        self.refresh()
-        return {'removed': bool(removed), 'name': p['mod'], 'mod_files_backup': str(b / 'removed-mod'),
-                'scope': 'Removed from the shared Mods folder; every profile is affected'}
+        return remove_managed_mod(self, p, b)
 
     def diagnostics(self, p, b):
         snapshot = self.snapshot()
-        enabled = {x['name'] for x in snapshot['plugins'] if x['active']}
-        positions = {x['name']: x['priority'] for x in snapshot['plugins']}
+        enabled = {x['name'].casefold() for x in snapshot['plugins'] if x['active']}
+        positions = {x['name'].casefold(): x['priority'] for x in snapshot['plugins']}
         problems = []
         for plugin in snapshot['plugins']:
             if not plugin['active']:
                 continue
             for master in plugin['masters']:
-                if master not in enabled:
+                if master.casefold() not in enabled:
                     problems.append({'type': 'missing_or_disabled_master', 'plugin': plugin['name'], 'master': master})
-                elif positions[master] > plugin['priority']:
+                elif positions[master.casefold()] > plugin['priority']:
                     problems.append({'type': 'master_loads_after_dependent', 'plugin': plugin['name'], 'master': master})
         full = sum(x['active'] and not x['light'] for x in snapshot['plugins'])
         light = sum(x['active'] and x['light'] for x in snapshot['plugins'])

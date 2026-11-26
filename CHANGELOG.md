@@ -1,36 +1,19 @@
 # Changelog
 
-Changes in the independent fork. Versions are listed newest first.
+Each entry compares a published version with the previous published version.
 
 ## 0.1.3-local.8-candidate.5
 
-- A Nexus retry refused before reservation now reports that no changes occurred. Failures after a reservation attempt retain the recovery warning.
-- Verified live on MO2 2.5.2 with an existing archive. There was no duplicate download and the original archive checksum matched.
+Changes since `0.1.3-local.4-candidate.1`.
 
-## 0.1.3-local.8-candidate.4
+### Added
 
-- Reports `no_archive` after cancellation or removal when MO2's queue is idle and the exact archive is absent.
-- An explicitly approved retry creates one successor request. Repeating it returns the same successor. Existing archives, partial files and uncertain transfers block retries.
+- Select an exact Nexus file by version and category. Queue eligible Premium downloads through the account signed into MO2, or track a browser-initiated **Mod Manager Download**. Request IDs survive restarts, and verified downloads return the archive path and SHA-256.
+- Retry a canceled or missing download with explicit approval. Repeating the retry returns the same successor request. Existing archives, partial files, and uncertain transfers block the retry.
+- Preview relative mod placement and native MO2 renames. Placement checks plugin providers. Renaming verifies the shared mod folder and affected saved profiles.
 
-## 0.1.3-local.8-candidate.3
+### Fixed
 
-- Lists Nexus files by version and category. Downloads one selected file through MO2's signed-in Premium account, or tracks a browser-initiated **Mod Manager Download**.
-- Retains request IDs across restarts. Verifies the Nexus game, mod and file IDs before returning the completed archive path and SHA-256.
-- Uses MO2's native authorization for Premium eligibility and recognizes MO2 2.5.2's Premium account label.
-- Premium downloads and pause, restart and resume passed live checks. The free-account flow awaits a live check.
-
-## 0.1.3-local.6 and 0.1.3-local.7
-
-- Scoped SKSE launch tracking to related process identities. Unrelated desktop processes no longer hold up writes after a verified Skyrim exit.
-- Clears the guard after cold and warm SKSE launches when only the verified Steam client and its helpers remain.
-
-## 0.1.3-local.5
-
-- Added previews for relative mod placement and native renaming. Placement checks plugin providers. Renaming verifies the shared folder and affected saved profiles.
-
-## 0.1.3-local.4
-
-- Retained verified SKSE exit evidence and durable recovery records for interrupted operations.
-- Improved configuration and load-order restoration, plugin ordering during installs and updates, and saved-state verification after removal.
-- Added read-only native backup inventory and cross-profile mod usage.
-- Made bridge upgrades recognize localized Windows process lists and verify the rollback copy.
+- After a verified Skyrim exit, unrelated desktop processes and verified Steam helpers no longer keep the SKSE write guard active. Skyrim, related tools, and unresolved launches still block writes.
+- Canceled or removed downloads now report `no_archive` once MO2's queue is idle and the exact download is absent.
+- A download refusal before reservation now reports that no changes occurred. Failures after a reservation attempt retain the recovery warning.

@@ -85,27 +85,36 @@ class PluginPersistence:
             plugins = self.read_lines('plugins.txt')
         except (OSError, UnicodeError) as error:
             return False, 'Profile files cannot be read: ' + str(error)
-        if [n.casefold() for n in loadorder] != expected:
-            return False, 'loadorder.txt does not match the complete requested order'
-        entries = [(n[1:] if n.startswith('*') else n).casefold() for n in plugins]
-        if len(entries) != len(set(entries)) or any(n not in states for n in entries):
-            return False, 'plugins.txt contains duplicate or unexpected plugins'
-        if entries != [n for n in expected if n in set(entries)]:
-            return False, 'plugins.txt order differs from the requested order'
-        written = {n: line.startswith('*') for n, line in zip(entries, plugins)}
-        for name, is_active in states.items():
-            if name not in written:
-                if is_active and name not in self.primary:
-                    return False, 'plugins.txt is missing an active plugin: ' + name
-            elif written[name] != is_active:
-                return False, 'plugins.txt activation differs from the request: ' + name
-        return True, ''
+        return saved_plugin_rows_match(loadorder, plugins, expected, states, self.primary)
 
     def read_lines(self, name):
-        data = (Path(self.profile[1]) / name).read_bytes()
-        try:
-            text = data.decode('utf-8-sig')
-        except UnicodeError:
-            text = data.decode('cp1252')
-        return [line.strip() for line in text.splitlines()
-                if line.strip() and not line.lstrip().startswith('#')]
+        return plugin_file_lines((Path(self.profile[1]) / name).read_bytes())
+
+
+def plugin_file_lines(data):
+    try:
+        text = data.decode('utf-8-sig')
+    except UnicodeError:
+        text = data.decode('cp1252')
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith('#')]
+
+
+def saved_plugin_rows_match(loadorder, plugins, expected, states, primary):
+    """Compare Skyrim SE native list rows against a previously observed live state."""
+    if [n.casefold() for n in loadorder] != expected:
+        return False, 'loadorder.txt does not match the complete requested order'
+    entries = [(n[1:] if n.startswith('*') else n).casefold() for n in plugins]
+    listed = set(entries)
+    if len(entries) != len(listed) or any(n not in states for n in entries):
+        return False, 'plugins.txt contains duplicate or unexpected plugins'
+    if entries != [n for n in expected if n in listed]:
+        return False, 'plugins.txt order differs from the requested order'
+    written = {n: line.startswith('*') for n, line in zip(entries, plugins)}
+    for name, is_active in states.items():
+        if name not in written:
+            if is_active and name not in primary:
+                return False, 'plugins.txt is missing an active plugin: ' + name
+        elif written[name] != is_active:
+            return False, 'plugins.txt activation differs from the request: ' + name
+    return True, ''

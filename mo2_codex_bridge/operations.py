@@ -1,6 +1,7 @@
 """All organizer access in this module runs on MO2's Qt GUI thread."""
 import json
 import os
+import secrets
 import shutil
 import time
 import uuid
@@ -17,14 +18,18 @@ from .order_recovery import read_order_backup, build_restore_plan, revalidate_re
 from .mod_persistence import ModListPersistence
 from .native_backups import browse_native_mod_backups
 from .profile_usage import report_mod_profile_usage
+from .mod_change_previews import ModChangePreviews
+from .mod_placement import build_placement
+from .mod_rename import build_rename
 
 READ_ACTIONS = {'status', 'snapshot', 'downloads', 'file_conflict', 'mod_conflicts',
                 'read_config', 'diagnostics', 'backups', 'logs', 'api_capabilities', 'profiles',
-                'native_mod_backups', 'mod_profile_usage'}
+                'native_mod_backups', 'mod_profile_usage', 'preview_mod_change',
+                'nexus_files', 'nexus_download_status'}
 WRITE_ACTIONS = {'create_separator', 'set_mod_priority', 'set_mod_active', 'set_plugin_active',
                  'set_plugin_order', 'install_archive', 'update_archive', 'write_config',
                  'restore_config', 'hide_file', 'unhide_file', 'restore_order', 'remove_empty_separator',
-                 'remove_mod', 'select_profile'}
+                 'remove_mod', 'select_profile', 'place_mod', 'rename_mod', 'nexus_download', 'nexus_download_retry'}
 
 
 class Operations:
@@ -35,6 +40,11 @@ class Operations:
         self.profile_selector = select_profile
         self.wait_until = wait_until
         self.running = set()
+        self.nexus = None
+        self.mod_previews = ModChangePreviews(self, secrets.token_bytes(32), {
+            'place_mod': lambda params, before: build_placement(self, params, before),
+            'rename_mod': lambda params, before: build_rename(self, params, before),
+        })
 
     def is_active(self, name):
         return bool(self.o.modList().state(name) & self.m.ModState.ACTIVE)
@@ -89,6 +99,7 @@ class Operations:
         operation_entered = False
         phase = 'preflight'
         result = None
+        prepared = None
         mutating = isinstance(action, str) and action in WRITE_ACTIONS
         try:
             if action not in READ_ACTIONS | WRITE_ACTIONS:
@@ -101,14 +112,27 @@ class Operations:
                     raise ValueError('Profile or state changed. Read snapshot again before making changes.')
                 if self.running:
                     raise ValueError('Close the game or running MO2-launched tools before changing mods')
-                phase = 'backup'
-                backup = self.data / 'backups' / (time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
-                backup.mkdir(parents=True)
-                backup_created = True
-                write_json(backup / 'before.json', before)
+                if action in {'nexus_download', 'nexus_download_retry'}:
+                    def before_claim():
+                        nonlocal phase, operation_entered
+                        phase = 'operation'
+                        operation_entered = True
+
+                    return getattr(self, action)(p, None, before_claim=before_claim)
+                if action in self.mod_previews.builders:
+                    prepared = self.mod_previews.prepare_apply(action, p, before)
+                if prepared is None or not prepared.summary['no_op']:
+                    phase = 'backup'
+                    backup = self.data / 'backups' / (time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+                    backup.mkdir(parents=True)
+                    backup_created = True
+                    write_json(backup / 'before.json', before)
             phase = 'operation'
             operation_entered = True
-            result = self.snapshot() if action == 'snapshot' else getattr(self, action)(p, backup)
+            if prepared is not None:
+                result = prepared.apply(backup)
+            else:
+                result = self.snapshot() if action == 'snapshot' else getattr(self, action)(p, backup)
             if backup is not None:
                 phase = 'result_record'
                 result['backup_id'] = backup.name
@@ -167,6 +191,9 @@ class Operations:
             result['job_retention'] = self.job_retention()
         return result
 
+    def preview_mod_change(self, p, b):
+        return self.mod_previews.preview(p)
+
     def native_mod_backups(self, p, b):
         return browse_native_mod_backups(self.o, p)
 
@@ -196,6 +223,35 @@ class Operations:
             if path.is_file() and path.suffix.lower() in {'.zip', '.7z', '.rar', '.omod', '.fomod'}:
                 files.append({'name': path.name, 'path': str(path), 'bytes': path.stat().st_size})
         return {'archives': files}
+
+    def nexus_files(self, p, b):
+        if self.nexus is None:
+            raise ValueError('Nexus operations are unavailable in this MO2 session')
+        return self.nexus.files(p)
+
+    def _nexus_download_change(self, operation, p, *, before_claim=None):
+        if self.nexus is None:
+            raise ValueError('Nexus operations are unavailable in this MO2 session')
+
+        def revalidate():
+            current = self.snapshot()
+            if current['profile'] != p['expected_profile'] or current['revision'] != p['expected_revision']:
+                raise ValueError('Profile or state changed while preparing the Nexus download')
+            if self.running:
+                raise ValueError('Close the game or running MO2-launched tools before requesting a download')
+
+        return getattr(self.nexus, operation)(p, revalidate=revalidate, before_claim=before_claim)
+
+    def nexus_download(self, p, b, *, before_claim=None):
+        return self._nexus_download_change('start', p, before_claim=before_claim)
+
+    def nexus_download_retry(self, p, b, *, before_claim=None):
+        return self._nexus_download_change('retry', p, before_claim=before_claim)
+
+    def nexus_download_status(self, p, b):
+        if self.nexus is None:
+            raise ValueError('Nexus operations are unavailable in this MO2 session')
+        return self.nexus.status(p)
 
     def file_conflict(self, p, b):
         relative = p['path'].replace('\\', '/')

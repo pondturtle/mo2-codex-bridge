@@ -14,7 +14,8 @@ MUTATING_ACTIONS = {'create_separator', 'set_mod_priority', 'set_mod_active',
                     'set_plugin_active', 'set_plugin_order', 'install_archive',
                     'update_archive', 'write_config', 'restore_config', 'hide_file',
                     'unhide_file', 'restore_order', 'remove_empty_separator',
-                    'installer_choose', 'remove_mod', 'select_profile'}
+                    'installer_choose', 'remove_mod', 'select_profile', 'place_mod', 'rename_mod',
+                    'nexus_download', 'nexus_download_retry'}
 
 
 class BridgeOperationError(RuntimeError):

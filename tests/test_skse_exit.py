@@ -676,6 +676,75 @@ class SkseExitTests(unittest.TestCase):
         self.observer.exit(child)
         self.assertFalse(self.guard)
 
+    def enable_exact_birth_probes(self):
+        def birth_stamp(pid, sequence):
+            self.observer.calls.append(("birth", pid))
+            process = self.observer.live.get(pid)
+            if process is not None and process.sequence == sequence:
+                return 7, process.created - (TICKS - 100000)
+            return None
+        self.observer.birth_stamp = birth_stamp
+
+    def test_matching_exit_excludes_a_verified_same_poll_desktop_tree(self):
+        self.enable_exact_birth_probes()
+        desktop = self.observer.spawn(2, 0, OTHER)
+        root, game = self.launch()
+        parent = self.observer.spawn(30, desktop.pid, OTHER)
+        self.observer.spawn(31, parent.pid, OTHER)
+        self.assertTrue(self.observe(), "Writes remain guarded while the game is running")
+        self.assertFalse(any(isinstance(call, tuple) and call[0] == "birth"
+                             for call in self.observer.calls))
+        self.close_tree(root, game)
+        self.assertEqual(self.guard.describe()["launches"], [])
+        self.assertIn(("birth", 31), self.observer.calls)
+
+    def test_late_related_child_blocks_while_late_desktop_child_clears(self):
+        self.enable_exact_birth_probes()
+        desktop = self.observer.spawn(2, 0, OTHER)
+        root, game = self.launch()
+        parent = self.observer.spawn(30, desktop.pid, OTHER)
+        desktop_child = self.observer.spawn(31, parent.pid, OTHER)
+        helper = self.observer.spawn(40, game.pid, OTHER)
+        self.assertTrue(self.observe())
+        self.observer.exit(root)
+        self.observer.exit(game)
+        self.guard.finished(LOADER, 0)
+        waiting = self.guard.describe()["launches"][0]
+        self.assertEqual(waiting["completion_survivor_pids"], [helper.pid])
+        self.assertEqual(waiting["completion_survivor_details"][0]["pid"], helper.pid)
+        late = self.observer.spawn(41, helper.pid, OTHER)
+        unrelated = self.observer.spawn(32, desktop_child.pid, OTHER)
+        self.assertEqual(self.guard.describe()["launches"][0]["completion_survivor_pids"],
+                         [helper.pid, late.pid])
+        self.observer.exit(helper)
+        self.assertEqual(self.guard.describe()["launches"][0]["completion_survivor_pids"], [late.pid])
+        self.observer.exit(late)
+        self.assertFalse(self.observe())
+        self.assertIn(unrelated.pid, self.observer.live)
+
+    def test_exact_skse_recovery_leaves_independent_wrapper_guard(self):
+        self.enable_exact_birth_probes()
+        desktop = self.observer.spawn(2, 0, OTHER)
+        wrapper = r"C:\offline-lifecycle-fixture\cmd.exe"
+        self.guard.starting(wrapper)
+        shell = self.observer.spawn(60, 1, wrapper)
+        child = self.observer.spawn(61, shell.pid, OTHER)
+        self.assertTrue(self.observe())
+        self.observer.exit(child)
+        self.observer.exit(shell)
+        self.guard.finished(wrapper, 0)
+        root, game = self.launch()
+        parent = self.observer.spawn(30, desktop.pid, OTHER)
+        self.observer.spawn(31, parent.pid, OTHER)
+        self.assertTrue(self.observe())
+        self.observer.exit(root)
+        self.observer.exit(game)
+        self.guard.finished(LOADER, 0)
+        records = self.guard.describe()["launches"]
+        self.assertEqual([item["executable"] for item in records], [wrapper])
+        self.assertTrue(records[0]["finish_uncertainty"])
+        self.assertTrue(self.observe())
+
     def test_new_start_reconciles_old_completion_before_new_baseline(self):
         helper = self.finish_with_survivor()
         self.assertTrue(self.guard)

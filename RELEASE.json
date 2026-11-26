@@ -1,24 +1,45 @@
 {
-  "version": "0.1.3-local.4-candidate.1",
-  "status": "Community fork source branch",
+  "version": "0.1.3-local.8-candidate.5",
+  "status": "Passed live Premium workflow and retry refusal checks on MO2 2.5.2. Free-account workflow awaits live verification.",
   "upstream": "https://github.com/shadowpendant69/mo2-codex-bridge",
   "upstream_base": "54f490224a1ceec53fc54e2a640ee8e8ec6cc202",
   "license": "MIT",
-  "tested_mo2": "2.5.2",
+  "target_mo2": "2.5.2",
   "tested_python": [
     "3.13.0",
     "3.15.2"
   ],
-  "offline_regression_tests": 501,
+  "offline_regression_tests": 709,
   "live_checks": [
+    "A completed archive blocked retry before reservation with changes_may_have_occurred=false",
+    "Original download remained verified, archive checksum matched, and no successor was created",
+    "Saved profile files matched before and after the live refusal check"
+  ],
+  "baseline_live_checks": [
     "Native backup inventory",
     "Cross-profile mod usage",
-    "Two sequential SKSE launches including deferred guard release"
+    "Two sequential SKSE launches including deferred guard release on .4",
+    "Preview, placement and reversible mod renaming on .5",
+    "Verified SKSE guard and unrelated desktop process exclusions on .6",
+    "Cold and warm SKSE guard verification with Steam left open on .7",
+    "Verified Premium file downloads, connector recovery and pause/restart/resume on .8.3",
+    "Reproduced misleading Nexus waiting status after native cancellation on .8.3",
+    "Verified explicit retry and existing-archive refusal in live MO2 on .8.4"
   ],
   "changes": [
     "Verified recovery and saved-state handling",
     "Read-only native backup inventory and mod usage",
     "SKSE exit evidence retention",
-    "Localized Windows installer process-list decoding"
+    "Localized Windows installer process-list decoding",
+    "State-bound previews with saved profile verification",
+    "Verified relative left-pane placement in the active profile",
+    "Verified native MO2 2.5.2 single-mod rename across saved profiles",
+    "Recoverable SKSE survivor exclusions using exact boot-relative process births",
+    "Scoped exclusion of MO2 2.5.2's unhooked Steam bootstrap and verified WebHelpers",
+    "Exact Nexus file selection, MO2-owned downloads and durable SHA-256 archive verification",
+    "Premium eligibility uses native Nexus authorization after exact catalog-and-MO2 identity checks",
+    "Premium account detection matches the en dash used by the native MO2 2.5.2 title",
+    "Idle-queue no-archive status and durable, explicitly authorized Nexus retry attempts",
+    "Precise preflight reporting for Nexus refusals before a new download reservation"
   ]
 }

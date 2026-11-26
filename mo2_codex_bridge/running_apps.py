@@ -8,10 +8,13 @@ other exact executable instances guarded even if one callback completes.
 import ctypes
 import ntpath
 import os
+import stat
 import time
 import uuid
 from copy import deepcopy
 from ctypes import wintypes
+
+from .steam_bootstrap import SteamBootstrap
 
 
 def path_key(value):
@@ -97,14 +100,31 @@ class _BasicProcessInformation(ctypes.Structure):
                 ("image", _UnicodeString)]
 
 
+class _ProcessTelemetryHeader(ctypes.Structure):
+    # PROCESS_TELEMETRY_ID_INFORMATION prefix through BootId. No fields
+    # after BootId (such as image or command-line offsets) are consumed.
+    _fields_ = [("header_size", wintypes.ULONG), ("pid", wintypes.ULONG),
+                ("start_key", ctypes.c_uint64), ("created", ctypes.c_uint64),
+                ("interrupt_time", ctypes.c_uint64), ("unbiased_time", ctypes.c_uint64),
+                ("sequence", ctypes.c_uint64), ("session_created", ctypes.c_uint64),
+                ("session_id", wintypes.ULONG), ("boot_id", wintypes.ULONG)]
+
+
 class WindowsProcessObserver:
-    """Inspect only basename candidates, then verify their full path and birth time."""
+    """Read exact executable lifetimes and process-generation metadata."""
     def __init__(self):
         if os.name != "nt":
             raise OSError("Windows process observation is unavailable")
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         self.kernel = kernel
         self.owner_pid = os.getpid()
+        query = getattr(ctypes.WinDLL("ntdll"), "NtQueryInformationProcess", None)
+        if query is not None:
+            query.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p,
+                              wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+            query.restype = wintypes.LONG
+        self._query_process = query
+
         class Entry(ctypes.Structure):
             _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
                         ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
@@ -132,6 +152,17 @@ class WindowsProcessObserver:
 
         kernel.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
         kernel.QueryDosDeviceW.restype = wintypes.DWORD
+        try:
+            realtime = ctypes.WinDLL("api-ms-win-core-realtime-l1-1-0", winmode=0x800)  # System32
+            interrupt_clock = getattr(realtime, "QueryInterruptTimePrecise", None)
+        except OSError:
+            interrupt_clock = None
+        if interrupt_clock is not None:
+            interrupt_clock.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+            interrupt_clock.restype = None
+        self._interrupt_clock = interrupt_clock
+        kernel.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+        kernel.GetDriveTypeW.restype = wintypes.UINT
 
     def identities(self):
         """Read parent PIDs and process sequences from one Windows snapshot."""
@@ -173,6 +204,95 @@ class WindowsProcessObserver:
                 break
             offset += entry.next_offset
         raise ValueError("Incomplete Windows process sequence snapshot")
+
+    def birth_stamp(self, pid, sequence):
+        """Return the boot ID and interrupt-time birth of the exact generation."""
+        handle = self.kernel.OpenProcess(0x1000, False, pid)  # Query-only access.
+        if not handle:
+            return None
+        try:
+            return self._handle_birth(handle, pid, sequence)
+        finally:
+            self.kernel.CloseHandle(handle)
+
+    def _handle_birth(self, handle, pid, sequence=None):
+        query = self._query_process
+        if query is None:
+            return None
+        size = 512
+        minimum = ctypes.sizeof(_ProcessTelemetryHeader)
+        while size <= 256 * 1024:
+            buffer = ctypes.create_string_buffer(size)
+            returned = wintypes.ULONG()
+            status = query(handle, 64, buffer, size, ctypes.byref(returned)) & 0xffffffff
+            if status in (0xc0000004, 0xc0000023, 0x80000005):
+                size = max(size * 2, returned.value)
+                continue
+            if status != 0 or not minimum <= returned.value <= size:
+                return None
+            entry = _ProcessTelemetryHeader.from_buffer_copy(buffer)
+            if (not minimum <= entry.header_size <= returned.value or entry.pid != pid
+                    or (sequence is not None and entry.sequence != sequence) or not entry.interrupt_time):
+                return None
+            return entry.boot_id, entry.interrupt_time
+        return None
+
+    def pinned_birth(self, process):
+        """Keep using the pinned loader handle even after it has exited."""
+        return self._handle_birth(process.handle, process.pid)
+
+    def interrupt_clock(self):
+        if self._interrupt_clock is None:
+            return None
+        value = ctypes.c_uint64()
+        self._interrupt_clock(ctypes.byref(value))
+        return value.value
+
+    def steam_executable(self):
+        import winreg
+
+        # Exact registry value used by MO2 2.5.2 startSteam. Never read
+        # Steam's login, command line, or any other registry value.
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam",
+                            access=winreg.KEY_QUERY_VALUE) as key:
+            value, kind = winreg.QueryValueEx(key, "SteamExe")
+        if kind != winreg.REG_SZ or not isinstance(value, str) or ntpath.basename(value).casefold() != "steam.exe":
+            return None
+        return self._plain_local_image(value)
+
+    def process_image(self, pid, sequence):
+        """Correlate the full image path with the generation on the same handle."""
+        process = self._open(pid, 0x1000, allow_departed=True)
+        if process is None:
+            return None
+        try:
+            if self._handle_birth(process.handle, pid, sequence) is None:
+                return None
+            return self._plain_local_image(process.executable)
+        finally:
+            process.close()
+
+    def _plain_local_image(self, value):
+        path = path_key(value)
+        drive, tail = ntpath.splitdrive(path)
+        if (len(drive) != 2 or not drive[0].isascii() or not drive[0].isalpha()
+                or drive[1] != ":" or not tail.startswith("\\") or ":" in tail
+                or self.kernel.GetDriveTypeW(drive + "\\") != 3):  # DRIVE_FIXED
+            return None
+        entry = os.lstat(path)
+        if not stat.S_ISREG(entry.st_mode):
+            return None
+        current = path
+        while True:
+            if entry.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                return None
+            parent = ntpath.dirname(current)
+            if current == parent:
+                return path
+            current = parent
+            entry = os.lstat(current)
+            if not stat.S_ISDIR(entry.st_mode):
+                return None
 
     def clock(self):
         now = wintypes.FILETIME()
@@ -245,16 +365,22 @@ class WindowsProcessObserver:
 
 
 class _ProcessLineage:
-    """Prove outside ancestry using ordered snapshots of opaque process identities."""
+    """Prove outside ancestry using exact parent generations and process lifetimes."""
 
     _MAX_SEQUENCES = 65536
+    _MAX_BIRTH_QUERIES = 32
 
-    def __init__(self, owner_pid, baseline):
+    def __init__(self, owner_pid, baseline, birth_stamp=None):
         self.owner_pid = owner_pid
         self.baseline = dict(baseline)
         self.previous = {}
         self.seen = {}
-        self.external_parent = {}
+        self.parent_links = {}
+        self._birth_stamp = birth_stamp
+        self._births = {}
+        self._first_parents = {}
+        self._next_probe = 0
+        self._unresolved_reasons = {}
         self.protected_pids = set()
         self.protected_sequences = set()
 
@@ -270,10 +396,10 @@ class _ProcessLineage:
                     owner_tree.add(child)
                     pending.append(child)
         self.observe(baseline)
-        self.external_parent.update(
+        self.parent_links.update(
             (sequence, None) for pid, (_, sequence) in baseline.items() if pid not in owner_tree)
 
-    def observe(self, rows, related_pids=()):
+    def observe(self, rows, related_pids=(), *, recover=False):
         if (len(rows) > self._MAX_SEQUENCES or self.owner_pid not in rows
                 or rows[self.owner_pid] != self.baseline.get(self.owner_pid)):
             raise ValueError("Incomplete Windows ancestry snapshot or lost MO2 process identity")
@@ -299,24 +425,105 @@ class _ProcessLineage:
                 raise ValueError("SKSE process ancestry history reached its capacity")
             self.seen[sequence] = fingerprint
 
+            current_parent = rows.get(parent)
+            if current_parent is not None and parent != pid:
+                self._first_parents[sequence] = current_parent[1]
             previous_parent = self.previous.get(parent)
-            if (previous_parent is not None and previous_parent == rows.get(parent)
-                    and previous_parent[1] in self.external_parent):
-                # The same parent generation was alive before the child first
-                # appeared and remains alive. Raw PID and wall-clock ordering
-                # cannot prove a link to a departed or replaced parent.
-                self.external_parent[sequence] = previous_parent[1]
+            if (previous_parent is not None and previous_parent == current_parent
+                    and previous_parent[1] in self.parent_links):
+                # The exact parent generation was observed before the child.
+                self.parent_links[sequence] = previous_parent[1]
         self.previous = dict(rows)
+        if recover:
+            self._recover_links(rows)
 
         decisions = {sequence: False for sequence in self.protected_sequences}
         return {pid for pid, entry in rows.items()
                 if self.baseline.get(pid) != entry and not self._is_external(entry[1], decisions)}
 
+    def _recover_links(self, rows):
+        """Revisit same-snapshot ancestry only after the exact game exits."""
+        candidates = []
+        self._unresolved_reasons = {}
+        for pid, (parent, sequence) in rows.items():
+            if self.baseline.get(pid) == (parent, sequence) or sequence in self.parent_links:
+                continue
+            if sequence in self.protected_sequences:
+                continue
+            first_parent = self._first_parents.get(sequence)
+            current_parent = rows.get(parent)
+            if first_parent is None:
+                self._unresolved_reasons[sequence] = "Parent generation was absent at first observation"
+            elif current_parent is None or current_parent[1] != first_parent:
+                self._unresolved_reasons[sequence] = "Original parent generation is no longer observable"
+            else:
+                candidates.append((pid, sequence, parent, first_parent))
+        if not candidates:
+            return
+        if not callable(self._birth_stamp):
+            self._unresolved_reasons.update((seq, "Process birth evidence is unavailable")
+                                            for _, seq, _, _ in candidates)
+            return
+
+        # Rotate over unresolved edges so a burst or persistent access failures
+        # cannot starve later entries. Cache exact, immutable births.
+        start = self._next_probe % len(candidates)
+        ordered = candidates[start:] + candidates[:start]
+        attempted = min(len(ordered), self._MAX_BIRTH_QUERIES // 2)
+        self._next_probe = start + attempted
+        for index, (pid, sequence, parent, parent_sequence) in enumerate(ordered):
+            if index >= attempted:
+                self._unresolved_reasons[sequence] = "Waiting to check the parent generation"
+                continue
+            child_birth = self._get_birth(pid, sequence)
+            parent_birth = self._get_birth(parent, parent_sequence)
+            if child_birth is None or parent_birth is None:
+                self._unresolved_reasons[sequence] = "Process birth evidence is unavailable"
+            elif parent_birth[0] != child_birth[0] or parent_birth[1] >= child_birth[1]:
+                self._unresolved_reasons[sequence] = "Parent lifetime at child creation could not be verified"
+            else:
+                self.parent_links[sequence] = parent_sequence
+
+    def _get_birth(self, pid, sequence):
+        entry = self._births.get(sequence)
+        if entry is not None:
+            return entry
+        try:
+            entry = self._birth_stamp(pid, sequence)
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(entry, tuple) or len(entry) != 2
+                or any(type(value) is not int for value in entry)
+                or not 0 <= entry[0] <= 0xffffffff or not 0 < entry[1] <= 0xffffffffffffffff):
+            return None
+        self._births[sequence] = entry
+        return entry
+
+    def survivor_details(self, pids):
+        details = []
+        for pid in pids:
+            parent, sequence = self.previous[pid]
+            reason = self._unresolved_reasons.get(sequence)
+            if reason is None:
+                ancestor = sequence
+                visited = set()
+                while ancestor in self.parent_links and ancestor not in self.protected_sequences:
+                    if ancestor in visited:
+                        break
+                    visited.add(ancestor)
+                    ancestor = self.parent_links[ancestor]
+                reason = ("Ancestry leads to a tracked game process" if ancestor in self.protected_sequences
+                          else "Ancestry does not establish an external process")
+            details.append({"pid": pid, "parent_pid": parent, "reason": reason})
+        return details
+
     def _is_external(self, sequence, decisions):
         chain = []
-        while sequence not in decisions and sequence in self.external_parent:
+        visited = set()
+        while sequence not in decisions and sequence in self.parent_links and sequence not in visited:
             chain.append(sequence)
-            sequence = self.external_parent[sequence]
+            visited.add(sequence)
+            sequence = self.parent_links[sequence]
         external = decisions.get(sequence, sequence is None)
         for member in chain:
             decisions[member] = external
@@ -326,13 +533,16 @@ class _ProcessLineage:
 class _SkseLaunch:
     """Proof for one standard SKSE loader and its directly launched Skyrim process."""
 
-    def __init__(self, observer, loader_path, game_path):
+    def __init__(self, observer, loader_path, game_path, steam_bootstrap):
         self.observer = observer
         self.loader_path = loader_path
         self.game_path = game_path
         self.processes = {}
         self.before_launch = None
         self.lineage = None
+        self.steam_bootstrap = steam_bootstrap
+        self.steam_start = None
+        self.steam_excluded = set()
         self.rapid_until = time.monotonic() + 5
         self.problem = None
 
@@ -346,7 +556,8 @@ class _SkseLaunch:
         self.problem = reason
         self.close()
 
-    def observe(self, *, checking_completion=False):
+    def observe(self, *, callback_evidence=None):
+        checking_completion = callback_evidence is not None
         scan_started = self.observer.clock()
         rows = self.observer.snapshot()
         if not rows or (self.before_launch is not None and scan_started < self.before_launch):
@@ -381,7 +592,10 @@ class _SkseLaunch:
                 if not keep:
                     process.close()
         if self.before_launch is None:
-            self.lineage = _ProcessLineage(self.observer.owner_pid, self.observer.identities())
+            self.lineage = _ProcessLineage(self.observer.owner_pid, self.observer.identities(),
+                                           getattr(self.observer, "birth_stamp", None))
+            if self.steam_bootstrap is not None:
+                self.steam_start = self.steam_bootstrap.capture_start(self.lineage)
             self.before_launch = self.observer.clock()
             if self.before_launch < scan_started:
                 raise ValueError("Windows clock moved during the prelaunch scan")
@@ -432,11 +646,18 @@ class _SkseLaunch:
                 raise ValueError("Skyrim started after the recorded SKSE launcher exited")
         possible_launch_pids = {pid for pid, (_, name) in rows.items() if name.casefold() in paths}
         possible_launch_pids.update(exits)
-        unresolved = self.lineage.observe(self.observer.identities(), possible_launch_pids)
+        unresolved = self.lineage.observe(self.observer.identities(), possible_launch_pids, recover=checking_completion)
         evidence = [{"pid": process.pid, "created": process.created, "executable": process.executable,
                      "exited": exits[process.pid]} for process in self.processes.values()]
         instances = [{k: v for k, v in item.items() if k != "exited"} for item in evidence
                      if item["exited"] is None]
+        if checking_completion:
+            if instances or evidence != callback_evidence:
+                raise ValueError("SKSE exit evidence changed during completion")
+            if self.steam_start is not None:
+                self.steam_excluded = unresolved & self.steam_bootstrap.excluded(
+                    self.lineage, rows, root, self.steam_start)
+                unresolved.difference_update(self.steam_excluded)
         for instance in instances:
             instance["children_observed"] = instance["pid"] == root.pid and game is not None
         return instances, evidence, unresolved
@@ -447,7 +668,7 @@ class _SkseLaunch:
 
 
 class RunningApplications:
-    def __init__(self, observer=None, *, on_skse_event=None):
+    def __init__(self, observer=None, *, on_skse_event=None, mo2_version=None):
         self._on_skse_event = on_skse_event
         self._session_id = uuid.uuid4().hex if on_skse_event is not None else None
         self._launch_number = 0
@@ -462,6 +683,8 @@ class RunningApplications:
         except Exception as error:
             self.observer = None
             self.observer_error = f"{type(error).__name__}: {error}"
+        self._steam_bootstrap = (SteamBootstrap(self.observer)
+                                 if self.observer is not None and mo2_version == "2.5.2" else None)
 
     def add(self, value):
         self.manual.add(str(value))
@@ -500,7 +723,7 @@ class RunningApplications:
                     directory = path_key(managed.gameDirectory().absolutePath())
                     if key == ntpath.join(directory, "skse64_loader.exe"):
                         self._skse_launches[key] = _SkseLaunch(
-                            self.observer, key, ntpath.join(directory, "skyrimse.exe"))
+                            self.observer, key, ntpath.join(directory, "skyrimse.exe"), self._steam_bootstrap)
             except Exception as error:
                 record["finish_uncertainty"] = f"Managed Skyrim path could not be verified: {error}"
         skse = self._skse_launches.get(key)
@@ -509,7 +732,9 @@ class RunningApplications:
                 self._launch_number += 1
                 record.update(launch_number=self._launch_number, completion_state="tracking",
                               first_uncertainty=None, completion_survivor_count=0,
-                              completion_survivor_pids=[], last_observed_processes=[],
+                              completion_survivor_pids=[], completion_survivor_details=[],
+                              steam_bootstrap_excluded_pids=[],
+                              last_observed_processes=[],
                               callback_exit_evidence=[])
                 self._skse_event("start", record, pending_before=previous_pending)
             else:
@@ -618,7 +843,10 @@ class RunningApplications:
                 "reason": record["finish_uncertainty"], "last_observed_processes": record["last_observed_processes"],
                 "callback_exit_evidence": record["callback_exit_evidence"],
                 "survivor_count": record["completion_survivor_count"],
-                "survivor_pids": record["completion_survivor_pids"], **details,
+                "survivor_pids": record["completion_survivor_pids"],
+                "survivor_details": record["completion_survivor_details"],
+                "steam_bootstrap_excluded_pids": record["steam_bootstrap_excluded_pids"],
+                **details,
             }))
         except Exception:
             # Diagnostics never influence launch or write authorization.
@@ -677,9 +905,8 @@ class RunningApplications:
     def _observe_skse(self, skse, record):
         checking = record["completion_state"] == "checking_survivors"
         try:
-            instances, evidence, survivors = skse.observe(checking_completion=checking)
-            if checking and (instances or evidence != record["callback_exit_evidence"]):
-                raise ValueError("SKSE exit evidence changed during completion")
+            instances, evidence, survivors = skse.observe(
+                callback_evidence=record["callback_exit_evidence"] if checking else None)
         except Exception as error:
             self._reject_skse(skse, record, f"{type(error).__name__}: {error}", observation=True)
             return
@@ -691,6 +918,8 @@ class RunningApplications:
             was_waiting = record["finish_uncertainty"] is not None
             record["completion_survivor_count"] = len(survivors)
             record["completion_survivor_pids"] = sorted(survivors)[:16]
+            record["completion_survivor_details"] = skse.lineage.survivor_details(record["completion_survivor_pids"])
+            record["steam_bootstrap_excluded_pids"] = sorted(skse.steam_excluded)[:65]
             if survivors:
                 reason = "Waiting for surviving processes that could not be excluded from the SKSE launch"
                 record["first_uncertainty"] = record["first_uncertainty"] or reason

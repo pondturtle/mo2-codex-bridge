@@ -17,6 +17,7 @@ from .operations import Operations, WRITE_ACTIONS
 from .transport import LocalTransport
 from .job_store import JobStore, public_job
 from .running_apps import RunningApplications
+from .nexus_downloads import NexusDownloads
 from . import dialogs
 
 
@@ -59,7 +60,11 @@ class BridgePlugin(mobase.IPluginTool):
         self.data.mkdir(parents=True, exist_ok=True)
         self.ops = Operations(organizer, mobase, self.data, self.refresh_sync, self.select_profile, self.wait_until)
         self.jobs = JobStore(self.data)
-        self.ops.running = RunningApplications(on_skse_event=self.audit_skse_event)
+        try:
+            mo2_version = organizer.appVersion().displayString()
+        except Exception:
+            mo2_version = None
+        self.ops.running = RunningApplications(on_skse_event=self.audit_skse_event, mo2_version=mo2_version)
         self.ops.running.managed_game = lambda: organizer.managedGame()
         self.ops.job_retention = self.jobs.describe
         try:
@@ -184,6 +189,7 @@ class BridgePlugin(mobase.IPluginTool):
             return
         self.token = secrets.token_urlsafe(48)
         self.main_window = main_window
+        self.ops.nexus = NexusDownloads(self.organizer, self.data, window=main_window)
         self.server = LocalTransport(self, main_window)
         write_json(self.data / 'session.json', {'version': VERSION, 'host': '127.0.0.1',
                                                'port': self.server.server_port, 'token': self.token,
@@ -330,6 +336,9 @@ class BridgePlugin(mobase.IPluginTool):
             self.timer.stop()
             self.server.close()
             self.server = None
+        if self.ops.nexus is not None:
+            self.ops.nexus.close()
+            self.ops.nexus = None
         session = self.data / 'session.json'
         if session.exists():
             session.unlink()

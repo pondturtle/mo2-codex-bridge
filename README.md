@@ -15,13 +15,30 @@ This fork adds verified Nexus downloads through MO2, mod placement and renaming,
 
 ## Install
 
-Use Windows, MO2 2.5.2 with Python plugin support, and an external Python. The client was tested on Python 3.13 and 3.15. Keep the checkout in a stable location. Close MO2 and run:
+Use Windows, MO2 2.5.2 with Python plugin support, and an external Python. The client was tested on Python 3.13 and 3.15.
+
+### First installation
+
+Put the verified release in a **permanent connector folder**, such as `C:\Tools\MO2-Codex-Bridge`. Choose one path to reuse for every update. Keep staging folders, release-numbered archives, and rollback copies separate. Setup registers the absolute path to the `mcp_server.py` beside the `setup.py` you execute.
+
+Close MO2. Replace the example paths with your own and run the dry run first. Check that its `server` points to your permanent folder before registering.
 
 ```powershell
+Set-Location -LiteralPath 'C:\Tools\MO2-Codex-Bridge'
+python setup.py --mo2 'C:\Tools\MO2' --dry-run
 python setup.py --mo2 'C:\Tools\MO2' --register-codex
 ```
 
-Use your own MO2 install path. Setup generates local connector settings. Use `--component-only` to keep an existing registration and point that client at the matching source. Reopen MO2, start a fresh client connection, and check `status` and `snapshot`.
+If you register manually, use the command from the `.mcp.json` generated in the permanent folder. Reopen MO2 and check `status` and `snapshot` through the regular connector.
+
+### Upgrade the same installation
+
+1. Stage and verify the new release in a separate folder. Record the existing connector command and its absolute script path. Finish pending bridge jobs and close MO2 and the connector clients before switching versions.
+2. Keep a verified rollback copy of the active connector, its local connector settings, and the installed MO2 component. Put the new source in the **same permanent folder** and preserve any generated local registration files you use.
+3. From the permanent folder run `python setup.py --mo2 'C:\Tools\MO2' --component-only`. This upgrades the MO2 component and preserves connector registration. The existing command still points to the same script path.
+4. Reopen MO2 and reconnect the client. Compare the connector version from MCP discovery, when available, with the MO2 component version from `status`. Check `status`, `snapshot`, and any newly added read action through the regular connector. Check an existing chat as well as a fresh connection. If acceptance fails, restore the previous connector and MO2 component together.
+
+If an older chat launches a connector from a release-numbered path, keep that launcher available while you plan and verify its migration. Verify the actions available in that chat before relying on the migrated connector.
 
 ## What it does
 

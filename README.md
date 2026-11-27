@@ -1,17 +1,17 @@
 # MO2 Codex Bridge
 
-Independent fork of [shadowpendant69/mo2-codex-bridge](https://github.com/shadowpendant69/mo2-codex-bridge). This branch carries `0.1.3-local.8-candidate.5`. The upstream project and fork changes were developed with AI assistance. [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
+Independent fork of [shadowpendant69/mo2-codex-bridge](https://github.com/shadowpendant69/mo2-codex-bridge). The current version is `0.1.3-local.8-candidate.7`. The upstream project and fork changes were developed with AI assistance. [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
 
 ## Why this fork exists
 
 This fork adds verified Nexus downloads through MO2, mod placement and renaming, and read-only backup and profile inventories. It also fixes bugs in launch tracking, mod operations, and recovery.
 
-- **SKSE exit tracking.** Keeps writes blocked while Skyrim or a related tool may still be running. Clears the guard after a verified exit even if Steam stays open.
+- **SKSE exit tracking.** Keeps writes blocked while Skyrim or a related tool may still be running. After a verified exit, waits only for processes linked to the launch. Steam can stay open.
 - **Download recovery.** Reports when a canceled download leaves no archive, allows one explicitly approved retry, and rejects a retry if the original archive is still present.
 - **Interrupted requests.** Keeps job records across restarts. If an install or write times out, you can look up the original job without running the operation again.
 - **Configuration and load-order recovery.** Checks the target profile, backup integrity, and dependency order before restoring. Preserves configuration file encoding and saves a recovery copy before applying a restore.
 - **Mod installs, updates, and removals.** Preserves the relative order of existing plugins in supported installs and keeps optional plugins disabled during supported updates. Checks that MO2 saved the expected lists after a removal.
-- **Bridge upgrades.** Detects running MO2 on localized Windows and keeps a verified rollback copy of the bridge component when upgrading.
+- **Bridge upgrades.** Detects running MO2 on localized Windows, upgrades the connector in place, and verifies rollback copies of the connector and MO2 component.
 
 ## Install
 
@@ -19,26 +19,27 @@ Use Windows, MO2 2.5.2 with Python plugin support, and an external Python. The c
 
 ### First installation
 
-Put the verified release in a **permanent connector folder**, such as `C:\Tools\MO2-Codex-Bridge`. Choose one path to reuse for every update. Keep staging folders, release-numbered archives, and rollback copies separate. Setup registers the absolute path to the `mcp_server.py` beside the `setup.py` you execute.
-
-Close MO2. Replace the example paths with your own and run the dry run first. Check that its `server` points to your permanent folder before registering.
+Put the verified release in a staging folder. Close MO2 and use your own MO2 path in the commands below.
 
 ```powershell
-Set-Location -LiteralPath 'C:\Tools\MO2-Codex-Bridge'
 python setup.py --mo2 'C:\Tools\MO2' --dry-run
 python setup.py --mo2 'C:\Tools\MO2' --register-codex
 ```
 
-If you register manually, use the command from the `.mcp.json` generated in the permanent folder. Reopen MO2 and check `status` and `snapshot` through the regular connector.
+The dry run shows the permanent server path under `%USERPROFILE%\.mo2-codex-bridge\connector\mo2_bridge.pyz`. Setup installs the connector there and registers that path. The folder serves one MO2 installation per Windows user. For manual registration, use the generated `.mcp.json` beside the installed connector.
+
+Reopen MO2 and connect the client. Compare the connector version from MCP discovery, when available, with the MO2 component version from `status`. Take a fresh `snapshot` before making changes.
 
 ### Upgrade the same installation
 
-1. Stage and verify the new release in a separate folder. Record the existing connector command and its absolute script path. Finish pending bridge jobs and close MO2 and the connector clients before switching versions.
-2. Keep a verified rollback copy of the active connector, its local connector settings, and the installed MO2 component. Put the new source in the **same permanent folder** and preserve any generated local registration files you use.
-3. From the permanent folder run `python setup.py --mo2 'C:\Tools\MO2' --component-only`. This upgrades the MO2 component and preserves connector registration. The existing command still points to the same script path.
-4. Reopen MO2 and reconnect the client. Compare the connector version from MCP discovery, when available, with the MO2 component version from `status`. Check `status`, `snapshot`, and any newly added read action through the regular connector. Check an existing chat as well as a fresh connection. If acceptance fails, restore the previous connector and MO2 component together.
+1. Stage and verify the new release. Finish pending bridge jobs, then close MO2 and the connector clients.
+2. Run `python setup.py --mo2 'C:\Tools\MO2'` from the new release. Setup updates the permanent connector and the MO2 component. It saves the prior artifacts separately and reports their recovery paths. Existing registration keeps the same launch path.
+3. Reopen MO2 and reconnect. Check the versions and one relevant read action. If an older Work chat is in use, verify there too before relying on new tools.
+4. If the update needs to be reversed, close MO2 and the connector clients and restore the verified previous connector and MO2 component together.
 
-If an older chat launches a connector from a release-numbered path, keep that launcher available while you plan and verify its migration. Verify the actions available in that chat before relying on the migrated connector.
+`--component-only` updates only the MO2 plugin for a separately managed connector. Existing registrations that point to a versioned release are preserved. Migrate versioned registrations explicitly. Keep any older launcher that resumed chats still call and verify that it forwards to the permanent path before relying on it.
+
+An existing chat can retain an older tool list after its connector is updated. Call `mo2_inspect` with action `api_capabilities` to discover the current actions. Reuse that list until the bridge version changes or a needed action is unavailable. Verify the connection with a read-only action.
 
 ## What it does
 
@@ -72,12 +73,12 @@ For Premium downloads, the public catalog and MO2 must agree on the exact file a
 
 ## Safety and verification
 
-Shared mod folders can affect every profile. Use fresh profile and revision checks for writes. Ambiguous launches keep writes blocked. Automatic SKSE exit recovery uses a Windows process identity API documented for Windows 11 build 26100.4770 and later. On uncertain results, check the original job ID and recovery record.
+Shared mod folders can affect every profile. Use fresh profile and revision checks for writes. Ambiguous launches keep writes blocked. SKSE exit recovery requires verified loader and game exits and holds for survivors linked by observed process ancestry. It uses Windows process identity APIs on Windows 11 build 26100.4770 or later. A helper whose entire ancestry is missed between snapshots cannot be identified. On uncertain results, check the original job ID and recovery record.
 
 After verified SKSE and Skyrim exits, MO2 2.5.2 can leave its unhooked Steam client and verified Steam WebHelpers running. The guard requires the registered installation path, exact process generations, and the expected launch order. Every other survivor retains its ordinary guard checks.
 
 The bridge uses authenticated localhost requests. Keep session configuration, audit logs and recovery files private. See [agent guidance](AGENTS.md) for operating details.
 
-Run `python -B -m unittest discover -s tests -v` in a fixture workspace. All 709 tests passed on Windows with Python 3.13 and 3.15. Live MO2 2.5.2 checks covered Premium downloads, pause and resume across restarts, cancellation, retry and the corrected refusal when an archive already exists. The free-account download flow still awaits a live check.
+Run `python -B -m unittest discover -s tests -v` in a fixture workspace. All 730 tests passed on both Windows Python 3.13 and 3.15. Live MO2 2.5.2 checks verified the connector upgrade, a read-only Nexus lookup in a resumed Work chat, and write refusal during Skyrim play followed by clearance after exit with Steam still open. The free-account download flow awaits live verification.
 
 To remove the bridge, close MO2, preserve its recovery files, remove the bridge component under `plugins`, and remove the connector registration.

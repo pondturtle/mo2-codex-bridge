@@ -1,4 +1,4 @@
-"""Late generation proof for the SKSE survivor guard, using only synthetic process data."""
+"""Exercise the birth checks for branches tied to an observed MO2 launch."""
 import unittest
 
 from mo2_codex_bridge.running_apps import _ProcessLineage
@@ -6,31 +6,19 @@ from mo2_codex_bridge.running_apps import _ProcessLineage
 
 OWNER = 10
 EXPLORER = 15
-DESKTOP = 20
-WORKER = 21
-CONSOLE = 22
-LATE_DESKTOP = 23
-GAME = 30
-GAME_HELPER = 31
-LATE_GAME_HELPER = 32
-UNKNOWN_PARENT = 99
+PARENT = 20
+CHILD = 21
+GRANDCHILD = 22
 BOOT = 3
-
 BASE = {1: (0, 700), OWNER: (EXPLORER, 900), EXPLORER: (1, 400)}
-# Put children before parents. Neither the row order nor the sequence values
-# express birth order. One first-seen snapshot can contain several generations.
-DESKTOP_BURST = {CONSOLE: (WORKER, 42), WORKER: (DESKTOP, 1), DESKTOP: (EXPLORER, 516)}
-DESKTOP_BIRTHS = {
-    (EXPLORER, 400): (BOOT, 100),
-    (DESKTOP, 516): (BOOT, 700),
-    (WORKER, 1): (BOOT, 710),
-    (CONSOLE, 42): (BOOT, 715),
-}
+TREE = {GRANDCHILD: (CHILD, 42), CHILD: (PARENT, 1), PARENT: (OWNER, 516)}
+BIRTHS = {(PARENT, 516): (BOOT, 700), (CHILD, 1): (BOOT, 710),
+          (GRANDCHILD, 42): (BOOT, 720)}
 
 
 class BirthStamps:
-    def __init__(self, stamps=None):
-        self.stamps = dict(stamps or {})
+    def __init__(self):
+        self.stamps = dict(BIRTHS)
         self.calls = []
 
     def __call__(self, pid, sequence):
@@ -40,103 +28,90 @@ class BirthStamps:
 
 class LateAncestryTests(unittest.TestCase):
     def setUp(self):
-        self.stamps = BirthStamps(DESKTOP_BIRTHS)
-        self.graph = _ProcessLineage(OWNER, BASE, birth_stamp=self.stamps)
+        self.stamps = BirthStamps()
+        self.graph = _ProcessLineage(OWNER, BASE, self.stamps)
 
-    def test_simultaneous_desktop_generations_clear_with_exact_birth_proof(self):
-        current = {**BASE, **DESKTOP_BURST}
-        # The baseline logic cannot tell whether the co-first PPID is the
-        # true parent. Repeating an ordinary scan must not create evidence.
-        self.assertEqual(self.graph.observe(current), {WORKER, CONSOLE})
-        self.assertEqual(self.graph.observe(current), {WORKER, CONSOLE})
+    def test_unrelated_process_burst_uses_no_birth_probes(self):
+        rows = {**BASE, **TREE, PARENT: (EXPLORER, 516), 23: (999, 6)}
+        self.assertEqual(self.graph.observe(rows, recover=True), set())
         self.assertEqual(self.stamps.calls, [])
-        self.assertEqual(self.graph.observe(current, recover=True), set())
 
-    def test_proof_may_arrive_on_a_later_poll_of_the_same_generations(self):
-        current = {**BASE, **DESKTOP_BURST}
-        del self.stamps.stamps[(WORKER, 1)]
-        self.assertEqual(self.graph.observe(current, recover=True), {WORKER, CONSOLE})
-        self.stamps.stamps[(WORKER, 1)] = (BOOT, 710)
-        self.assertEqual(self.graph.observe(current, recover=True), set())
+    def test_late_birth_proof_can_confirm_an_already_guarded_child(self):
+        rows = {**BASE, **TREE}
+        birth = self.stamps.stamps.pop((CHILD, 1))
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD, GRANDCHILD})
+        self.assertNotIn(1, self.graph.parent_links)
+        self.stamps.stamps[(CHILD, 1)] = birth
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD, GRANDCHILD})
+        self.assertEqual(self.graph.parent_links[1], 516)
+        self.assertEqual(self.graph.parent_links[42], 1)
 
-    def test_late_desktop_child_clears_while_late_game_child_keeps_blocking(self):
-        current = {
-            **BASE,
-            **DESKTOP_BURST,
-            GAME: (OWNER, 77),
-            GAME_HELPER: (GAME, 78),
-        }
-        self.stamps.stamps.update({
-            (GAME, 77): (BOOT, 200),
-            (GAME_HELPER, 78): (BOOT, 705),
-            (LATE_GAME_HELPER, 80): (BOOT, 900),
-            (LATE_DESKTOP, 81): (BOOT, 901),
-        })
-        self.assertEqual(self.graph.observe(current, related_pids={GAME}, recover=True), {GAME, GAME_HELPER})
-        del current[GAME]
-        current[LATE_GAME_HELPER] = (GAME_HELPER, 80)
-        current[LATE_DESKTOP] = (WORKER, 81)
-        self.assertEqual(self.graph.observe(current, recover=True), {GAME_HELPER, LATE_GAME_HELPER})
-        del current[GAME_HELPER]
-        self.assertEqual(self.graph.observe(current, recover=True), {LATE_GAME_HELPER})
-        del current[LATE_GAME_HELPER]
-        self.assertEqual(self.graph.observe(current, recover=True), set())
+    def test_mixed_branches_keep_only_launch_descendants(self):
+        rows = {**BASE, **TREE, 30: (EXPLORER, 77), 31: (30, 78)}
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD, GRANDCHILD})
+        self.assertTrue(all(pid not in {30, 31} for pid, _ in self.stamps.calls))
+        rows.pop(PARENT)
+        rows.pop(CHILD)
+        self.assertEqual(self.graph.observe(rows, recover=True), {GRANDCHILD})
+        rows.pop(GRANDCHILD)
+        self.assertEqual(self.graph.observe(rows, recover=True), set())
 
-    def test_late_child_of_unresolved_ancestor_cannot_become_external(self):
-        current = {**BASE, GAME_HELPER: (UNKNOWN_PARENT, 78)}
-        self.stamps.stamps[(GAME_HELPER, 78)] = (BOOT, 800)
-        self.assertEqual(self.graph.observe(current, recover=True), {GAME_HELPER})
-        current[LATE_GAME_HELPER] = (GAME_HELPER, 80)
-        self.stamps.stamps[(LATE_GAME_HELPER, 80)] = (BOOT, 900)
-        self.assertEqual(self.graph.observe(current, recover=True), {GAME_HELPER, LATE_GAME_HELPER})
-        del current[GAME_HELPER]
-        self.assertEqual(self.graph.observe(current, recover=True), {LATE_GAME_HELPER})
+    def test_first_observed_child_of_departed_launch_parent_stays_guarded(self):
+        self.graph.observe({**BASE, PARENT: TREE[PARENT]})
+        rows = {**BASE, CHILD: TREE[CHILD]}
+        self.assertEqual(self.graph.observe(rows, recover=True), {CHILD})
+        rows[GRANDCHILD] = TREE[GRANDCHILD]
+        self.assertEqual(self.graph.observe(rows, recover=True), {CHILD, GRANDCHILD})
+        rows.pop(CHILD)
+        self.assertEqual(self.graph.observe(rows, recover=True), {GRANDCHILD})
 
-    def test_late_appearance_of_a_previously_missing_parent_cannot_certify_child(self):
-        without_parent = {**BASE, WORKER: (DESKTOP, 1)}
-        self.assertEqual(self.graph.observe(without_parent, recover=True), {WORKER})
-        # Even superficially compatible birth data cannot turn the missing
-        # generation from the first observation into this later one.
-        with_parent = {**without_parent, DESKTOP: (EXPLORER, 516)}
-        self.assertEqual(self.graph.observe(with_parent, recover=True), {WORKER})
+    def test_later_pid_appearance_cannot_reparent_preexisting_child(self):
+        rows = {**BASE, CHILD: TREE[CHILD]}
+        self.assertEqual(self.graph.observe(rows, recover=True), set())
+        rows[PARENT] = TREE[PARENT]
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT})
+        self.assertNotIn((CHILD, 1), self.stamps.calls)
 
-    def test_recycled_parent_pid_cannot_replace_the_first_observed_generation(self):
-        first = {**BASE, DESKTOP: (EXPLORER, 516), WORKER: (DESKTOP, 1)}
-        del self.stamps.stamps[(DESKTOP, 516)]
-        self.assertEqual(self.graph.observe(first, recover=True), {WORKER})
-        replacement = {**first, DESKTOP: (EXPLORER, 517)}
-        self.stamps.stamps[(DESKTOP, 517)] = (BOOT, 720)
-        self.assertEqual(self.graph.observe(replacement, recover=True), {WORKER})
+    def test_replacement_parent_cannot_resolve_existing_ambiguous_launch_link(self):
+        rows = {**BASE, PARENT: TREE[PARENT], CHILD: TREE[CHILD]}
+        self.stamps.stamps.pop((PARENT, 516))
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD})
+        rows[PARENT] = (EXPLORER, 517)
+        self.stamps.stamps[(PARENT, 517)] = (BOOT, 730)
+        self.assertEqual(self.graph.observe(rows, recover=True), {CHILD})
 
-    def test_stale_birth_stamps_do_not_authorize_reused_pids(self):
-        current = {**BASE, **DESKTOP_BURST}
-        self.assertEqual(self.graph.observe(current, recover=True), set())
-        self.assertEqual(self.graph.observe(BASE, recover=True), set())
-        replacement = {**BASE, DESKTOP: (EXPLORER, 600), WORKER: (DESKTOP, 601)}
-        self.assertEqual(self.graph.observe(replacement, recover=True), {WORKER})
+    def test_new_child_is_tied_to_reused_parent_only_if_birth_matches(self):
+        self.graph.observe({**BASE, PARENT: TREE[PARENT]})
+        rows = {**BASE, PARENT: (EXPLORER, 517), CHILD: TREE[CHILD]}
+        # Previous linked generation and current external generation are
+        # candidates. The exact external generation was older than the child.
+        self.stamps.stamps[(PARENT, 517)] = (BOOT, 705)
+        self.assertEqual(self.graph.observe(rows), {CHILD})
+        self.assertEqual(self.graph.observe(rows, recover=True), set())
+        self.assertEqual(self.graph.parent_links[1], 517)
 
-    def test_same_poll_parent_born_after_child_cannot_certify_it(self):
-        current = {**BASE, DESKTOP: (EXPLORER, 516), WORKER: (DESKTOP, 1)}
-        self.stamps.stamps[(DESKTOP, 516)] = (BOOT, 711)
-        self.assertEqual(self.graph.observe(current, recover=True), {WORKER})
+    def test_younger_current_parent_does_not_create_a_launch_link(self):
+        rows = {**BASE, PARENT: TREE[PARENT], CHILD: TREE[CHILD]}
+        self.stamps.stamps[(PARENT, 516)] = (BOOT, 711)
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT})
 
-    def test_equal_birth_values_do_not_prove_parent_precedes_child(self):
-        current = {**BASE, DESKTOP: (EXPLORER, 516), WORKER: (DESKTOP, 1)}
-        self.stamps.stamps[(DESKTOP, 516)] = self.stamps.stamps[(WORKER, 1)]
-        self.assertEqual(self.graph.observe(current, recover=True), {WORKER})
+    def test_equal_birth_values_do_not_disprove_an_ambiguous_link(self):
+        rows = {**BASE, PARENT: TREE[PARENT], CHILD: TREE[CHILD]}
+        self.stamps.stamps[(PARENT, 516)] = self.stamps.stamps[(CHILD, 1)]
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD})
+        self.assertNotIn(1, self.graph.parent_links)
 
-    def test_birth_stamps_from_different_boot_contexts_do_not_certify_an_edge(self):
-        current = {**BASE, DESKTOP: (EXPLORER, 516), WORKER: (DESKTOP, 1)}
-        self.stamps.stamps[(DESKTOP, 516)] = (BOOT + 1, 700)
-        self.assertEqual(self.graph.observe(current, recover=True), {WORKER})
+    def test_different_boot_contexts_leave_a_targeted_link_unresolved(self):
+        rows = {**BASE, PARENT: TREE[PARENT], CHILD: TREE[CHILD]}
+        self.stamps.stamps[(PARENT, 516)] = (BOOT + 1, 700)
+        self.assertEqual(self.graph.observe(rows, recover=True), {PARENT, CHILD})
+        self.assertNotIn(1, self.graph.parent_links)
 
-    def test_late_related_generation_revokes_proof_through_the_whole_chain(self):
-        current = {**BASE, **DESKTOP_BURST}
-        self.assertEqual(self.graph.observe(current, recover=True), set())
-        self.assertEqual(self.graph.observe(current, related_pids={DESKTOP}, recover=True),
-                         {DESKTOP, WORKER, CONSOLE})
-        del current[DESKTOP]
-        self.assertEqual(self.graph.observe(current, recover=True), {WORKER, CONSOLE})
+    def test_pinned_exited_root_can_scope_a_newly_observed_child(self):
+        rows = {**BASE, CHILD: TREE[CHILD], GRANDCHILD: TREE[GRANDCHILD]}
+        self.assertEqual(self.graph.observe(rows, related={PARENT: 516}, recover=True), {CHILD, GRANDCHILD})
+        rows.pop(CHILD)
+        self.assertEqual(self.graph.observe(rows, related={PARENT: 516}, recover=True), {GRANDCHILD})
 
 
 if __name__ == "__main__":

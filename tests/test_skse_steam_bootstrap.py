@@ -87,7 +87,10 @@ class SteamBootstrapTests(unittest.TestCase):
 
     def classify(self, window, loader, *, protected=()):
         start, graph = window
-        unresolved = graph.observe(self.observer.identities(), protected, recover=True)
+        rows = self.observer.identities()
+        related = {pid: rows[pid][1] if pid in rows else self.observer.pinned_sequence(loader)
+                   for pid in protected}
+        unresolved = graph.observe(rows, related, recover=True)
         excluded = self.bootstrap.excluded(graph, self.observer.snapshot(), loader, start)
         return unresolved, excluded
 

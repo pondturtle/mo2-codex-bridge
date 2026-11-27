@@ -1,6 +1,6 @@
 {
-  "version": "0.1.3-local.8-candidate.5",
-  "status": "Passed live Premium workflow and retry refusal checks on MO2 2.5.2. Free-account workflow awaits live verification.",
+  "version": "0.1.3-local.8-candidate.7",
+  "status": "Accepted on MO2 2.5.2. Free-account Nexus downloads await live verification.",
   "upstream": "https://github.com/shadowpendant69/mo2-codex-bridge",
   "upstream_base": "54f490224a1ceec53fc54e2a640ee8e8ec6cc202",
   "license": "MIT",
@@ -9,11 +9,11 @@
     "3.13.0",
     "3.15.2"
   ],
-  "offline_regression_tests": 709,
+  "offline_regression_tests": 730,
   "live_checks": [
-    "A completed archive blocked retry before reservation with changes_may_have_occurred=false",
-    "Original download remained verified, archive checksum matched, and no successor was created",
-    "Saved profile files matched before and after the live refusal check"
+    "Verified upgrade of the permanent connector and MO2 component with matching rollback copies",
+    "Write probe blocked during SKSE and cleared after verified Skyrim exit with MO2 and Steam still running",
+    "Read-only Nexus file lookup succeeded in a resumed Work chat after migrating its launcher"
   ],
   "baseline_live_checks": [
     "Native backup inventory",
@@ -24,7 +24,9 @@
     "Cold and warm SKSE guard verification with Steam left open on .7",
     "Verified Premium file downloads, connector recovery and pause/restart/resume on .8.3",
     "Reproduced misleading Nexus waiting status after native cancellation on .8.3",
-    "Verified explicit retry and existing-archive refusal in live MO2 on .8.4"
+    "Verified explicit retry and existing-archive refusal in live MO2 on .8.4",
+    "Verified preflight refusal reporting for an existing archive on .8.5",
+    "Verified existing Codex Work chat connector compatibility on .8.6"
   ],
   "changes": [
     "Verified recovery and saved-state handling",
@@ -40,6 +42,8 @@
     "Premium eligibility uses native Nexus authorization after exact catalog-and-MO2 identity checks",
     "Premium account detection matches the en dash used by the native MO2 2.5.2 title",
     "Idle-queue no-archive status and durable, explicitly authorized Nexus retry attempts",
-    "Precise preflight reporting for Nexus refusals before a new download reservation"
+    "Precise preflight reporting for Nexus refusals before a new download reservation",
+    "Permanent per-user connector installation with verified upgrades, separate rollback copies, and preserved existing Codex registration",
+    "SKSE survivor checks follow observed MO2, loader and game process ancestry while retaining unresolved launch guards"
   ]
 }

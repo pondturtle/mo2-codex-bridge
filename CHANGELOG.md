@@ -2,6 +2,18 @@
 
 Each entry compares a published version with the previous published version.
 
+## 0.1.3-local.8-candidate.7
+
+Changes since `0.1.3-local.8-candidate.5`.
+
+### Changed
+
+- Setup installs the connector at a permanent per-user path. Upgrades preserve the existing registration and verify separate rollback copies for the connector and MO2 plugin.
+
+### Fixed
+
+- After verifying SKSE and Skyrim exits, the write guard checks surviving processes linked to the launch by Windows process ancestry. Unrelated processes no longer hold the guard open. Active helpers and unresolved launches still block writes.
+
 ## 0.1.3-local.8-candidate.5
 
 Changes since `0.1.3-local.4-candidate.1`.

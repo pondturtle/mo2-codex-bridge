@@ -215,7 +215,7 @@ class WindowsProcessObserver:
         finally:
             self.kernel.CloseHandle(handle)
 
-    def _handle_birth(self, handle, pid, sequence=None):
+    def _handle_telemetry(self, handle, pid, sequence=None):
         query = self._query_process
         if query is None:
             return None
@@ -234,8 +234,19 @@ class WindowsProcessObserver:
             if (not minimum <= entry.header_size <= returned.value or entry.pid != pid
                     or (sequence is not None and entry.sequence != sequence) or not entry.interrupt_time):
                 return None
-            return entry.boot_id, entry.interrupt_time
+            return entry
         return None
+
+    def _handle_birth(self, handle, pid, sequence=None):
+        entry = self._handle_telemetry(handle, pid, sequence)
+        return (entry.boot_id, entry.interrupt_time) if entry is not None else None
+
+    def pinned_sequence(self, process):
+        """Bind a held SKSE or game handle to its Windows process generation."""
+        entry = self._handle_telemetry(process.handle, process.pid)
+        if entry is None:
+            raise ValueError("The pinned launch process generation could not be verified")
+        return entry.sequence
 
     def pinned_birth(self, process):
         """Keep using the pinned loader handle even after it has exited."""
@@ -365,7 +376,7 @@ class WindowsProcessObserver:
 
 
 class _ProcessLineage:
-    """Prove outside ancestry using exact parent generations and process lifetimes."""
+    """Retain only survivors with process-generation evidence tied to the launch."""
 
     _MAX_SEQUENCES = 65536
     _MAX_BIRTH_QUERIES = 32
@@ -376,15 +387,19 @@ class _ProcessLineage:
         self.previous = {}
         self.seen = {}
         self.parent_links = {}
+        self._first_parents = {}
+        self._possible_parents = {}
         self._birth_stamp = birth_stamp
         self._births = {}
-        self._first_parents = {}
         self._next_probe = 0
         self._unresolved_reasons = {}
-        self.protected_pids = set()
         self.protected_sequences = set()
+        self._owner_sequences = set()
 
-        # A prelaunch process under MO2 cannot establish a separate branch.
+        self.observe(baseline)
+        # Only the exact MO2 generation and its observed starting subtree
+        # can link an MO2-spawned branch to this launch. The baseline
+        # processes themselves do not count as new survivors.
         children = {}
         for pid, (parent, _) in baseline.items():
             children.setdefault(parent, []).append(pid)
@@ -395,94 +410,134 @@ class _ProcessLineage:
                 if child not in owner_tree:
                     owner_tree.add(child)
                     pending.append(child)
-        self.observe(baseline)
-        self.parent_links.update(
-            (sequence, None) for pid, (_, sequence) in baseline.items() if pid not in owner_tree)
+        self._owner_sequences = {baseline[pid][1] for pid in owner_tree}
 
-    def observe(self, rows, related_pids=(), *, recover=False):
+    def observe(self, rows, related=None, *, recover=False):
         if (len(rows) > self._MAX_SEQUENCES or self.owner_pid not in rows
                 or rows[self.owner_pid] != self.baseline.get(self.owner_pid)):
             raise ValueError("Incomplete Windows ancestry snapshot or lost MO2 process identity")
 
-        new_protected = set(related_pids) - self.protected_pids
-        if new_protected:
-            self.protected_sequences.update(
-                sequence for sequence, (pid, _) in self.seen.items() if pid in new_protected)
-            self.protected_pids.update(new_protected)
+        related = {} if related is None else related
+        newly_pinned = {}
+        for pid, sequence in related.items():
+            row = rows.get(pid)
+            past = self.seen.get(sequence)
+            if (type(pid) is not int or pid <= 0 or type(sequence) is not int or sequence < 0
+                    or (row is not None and row[1] != sequence)
+                    or (past is not None and past[0] != pid)):
+                raise ValueError("The ancestry snapshot disagrees with a pinned launch process")
+            if sequence not in self.protected_sequences:
+                newly_pinned[pid] = sequence
+            self.protected_sequences.add(sequence)
 
         for pid, (parent, sequence) in rows.items():
             if (type(pid) is not int or pid <= 0 or type(parent) is not int or parent < 0
                     or type(sequence) is not int or sequence < 0):
                 raise ValueError("Invalid Windows process ancestry identity")
-            if pid in self.protected_pids:
-                self.protected_sequences.add(sequence)
             fingerprint = (pid, parent)
             if sequence in self.seen:
                 if self.seen[sequence] != fingerprint or self.previous.get(pid) != (parent, sequence):
                     raise ValueError("Contradictory Windows process ancestry identity")
+                if (parent in newly_pinned and parent != pid and sequence not in self.parent_links
+                        and self.baseline.get(pid) != (parent, sequence)):
+                    # An exited loader can be pinned after this child first
+                    # appeared. Its retained handle adds one possible parent
+                    # generation without overriding an already proved edge.
+                    self._possible_parents.setdefault(sequence, set()).add(newly_pinned[parent])
                 continue
             if len(self.seen) >= self._MAX_SEQUENCES:
                 raise ValueError("SKSE process ancestry history reached its capacity")
             self.seen[sequence] = fingerprint
+            if parent == pid:
+                continue
 
             current_parent = rows.get(parent)
-            if current_parent is not None and parent != pid:
-                self._first_parents[sequence] = current_parent[1]
             previous_parent = self.previous.get(parent)
-            if (previous_parent is not None and previous_parent == current_parent
-                    and previous_parent[1] in self.parent_links):
-                # The exact parent generation was observed before the child.
+            if current_parent is not None:
+                self._first_parents[sequence] = current_parent[1]
+            if previous_parent is not None and previous_parent == current_parent:
+                # This parent generation was already present before the
+                # child appeared and still exists in the same snapshot.
                 self.parent_links[sequence] = previous_parent[1]
+            else:
+                # A first-seen parent or an immediately departed parent is
+                # a possible link. Keep the exact generations, even after
+                # the corresponding PIDs have been recycled.
+                possible = {entry[1] for entry in (previous_parent, current_parent) if entry is not None}
+                if parent in related:
+                    possible.add(related[parent])
+                if possible:
+                    self._possible_parents[sequence] = possible
         self.previous = dict(rows)
+        scoped = self._launch_sequences()
         if recover:
-            self._recover_links(rows)
-
-        decisions = {sequence: False for sequence in self.protected_sequences}
+            self._recover_links(rows, scoped)
+            scoped = self._launch_sequences()
         return {pid for pid, entry in rows.items()
-                if self.baseline.get(pid) != entry and not self._is_external(entry[1], decisions)}
+                if self.baseline.get(pid) != entry and entry[1] in scoped}
 
-    def _recover_links(self, rows):
-        """Revisit same-snapshot ancestry only after the exact game exits."""
+    def _launch_sequences(self):
+        children = {}
+        for child, parent in self.parent_links.items():
+            children.setdefault(parent, []).append(child)
+        for child, parents in self._possible_parents.items():
+            for parent in parents:
+                children.setdefault(parent, []).append(child)
+        related = self._owner_sequences | self.protected_sequences
+        pending = list(related)
+        while pending:
+            for child in children.get(pending.pop(), ()):
+                if child not in related:
+                    related.add(child)
+                    pending.append(child)
+        return related
+
+    def _recover_links(self, rows, scoped):
+        """Probe competing parent generations only inside the launch scope."""
         candidates = []
         self._unresolved_reasons = {}
         for pid, (parent, sequence) in rows.items():
-            if self.baseline.get(pid) == (parent, sequence) or sequence in self.parent_links:
+            if sequence not in scoped or sequence in self.protected_sequences:
                 continue
-            if sequence in self.protected_sequences:
+            potential = self._possible_parents.get(sequence)
+            if potential is None or self.baseline.get(pid) == (parent, sequence):
                 continue
-            first_parent = self._first_parents.get(sequence)
             current_parent = rows.get(parent)
-            if first_parent is None:
-                self._unresolved_reasons[sequence] = "Parent generation was absent at first observation"
-            elif current_parent is None or current_parent[1] != first_parent:
-                self._unresolved_reasons[sequence] = "Original parent generation is no longer observable"
+            if current_parent is None or current_parent[1] not in potential:
+                self._unresolved_reasons[sequence] = "A launch-linked parent generation is no longer observable"
             else:
-                candidates.append((pid, sequence, parent, first_parent))
+                candidates.append((pid, sequence, parent, current_parent[1]))
         if not candidates:
             return
         if not callable(self._birth_stamp):
-            self._unresolved_reasons.update((seq, "Process birth evidence is unavailable")
+            self._unresolved_reasons.update((seq, "Launch-linked process birth evidence is unavailable")
                                             for _, seq, _, _ in candidates)
             return
 
-        # Rotate over unresolved edges so a burst or persistent access failures
-        # cannot starve later entries. Cache exact, immutable births.
+        # Rotate within the launch scope so unrelated Windows processes
+        # cannot consume the birth-query budget.
         start = self._next_probe % len(candidates)
         ordered = candidates[start:] + candidates[:start]
         attempted = min(len(ordered), self._MAX_BIRTH_QUERIES // 2)
         self._next_probe = start + attempted
         for index, (pid, sequence, parent, parent_sequence) in enumerate(ordered):
             if index >= attempted:
-                self._unresolved_reasons[sequence] = "Waiting to check the parent generation"
+                self._unresolved_reasons[sequence] = "Waiting to check a launch-linked parent generation"
                 continue
             child_birth = self._get_birth(pid, sequence)
             parent_birth = self._get_birth(parent, parent_sequence)
-            if child_birth is None or parent_birth is None:
-                self._unresolved_reasons[sequence] = "Process birth evidence is unavailable"
-            elif parent_birth[0] != child_birth[0] or parent_birth[1] >= child_birth[1]:
-                self._unresolved_reasons[sequence] = "Parent lifetime at child creation could not be verified"
-            else:
+            if child_birth is None or parent_birth is None or parent_birth[0] != child_birth[0]:
+                self._unresolved_reasons[sequence] = "Launch-linked process birth evidence is unavailable"
+            elif parent_birth[1] < child_birth[1]:
                 self.parent_links[sequence] = parent_sequence
+                self._possible_parents.pop(sequence)
+            elif parent_birth[1] > child_birth[1]:
+                # A recycled PID whose current process is younger than the
+                # child cannot be that child's parent. Any older generation
+                # captured with the child remains a possible link.
+                self._possible_parents[sequence].discard(parent_sequence)
+            else:
+                self._unresolved_reasons[sequence] = "Launch-linked parent birth order could not be verified"
 
     def _get_birth(self, pid, sequence):
         entry = self._births.get(sequence)
@@ -501,33 +556,20 @@ class _ProcessLineage:
 
     def survivor_details(self, pids):
         details = []
+        roots = self._owner_sequences | self.protected_sequences
         for pid in pids:
             parent, sequence = self.previous[pid]
             reason = self._unresolved_reasons.get(sequence)
             if reason is None:
                 ancestor = sequence
                 visited = set()
-                while ancestor in self.parent_links and ancestor not in self.protected_sequences:
-                    if ancestor in visited:
-                        break
+                while ancestor in self.parent_links and ancestor not in roots and ancestor not in visited:
                     visited.add(ancestor)
                     ancestor = self.parent_links[ancestor]
-                reason = ("Ancestry leads to a tracked game process" if ancestor in self.protected_sequences
-                          else "Ancestry does not establish an external process")
+                reason = ("Ancestry leads to a tracked MO2 or Skyrim process" if ancestor in roots
+                          else "A process linked to this launch has an unconfirmed parent generation")
             details.append({"pid": pid, "parent_pid": parent, "reason": reason})
         return details
-
-    def _is_external(self, sequence, decisions):
-        chain = []
-        visited = set()
-        while sequence not in decisions and sequence in self.parent_links and sequence not in visited:
-            chain.append(sequence)
-            visited.add(sequence)
-            sequence = self.parent_links[sequence]
-        external = decisions.get(sequence, sequence is None)
-        for member in chain:
-            decisions[member] = external
-        return external
 
 
 class _SkseLaunch:
@@ -538,6 +580,7 @@ class _SkseLaunch:
         self.loader_path = loader_path
         self.game_path = game_path
         self.processes = {}
+        self.process_sequences = {}
         self.before_launch = None
         self.lineage = None
         self.steam_bootstrap = steam_bootstrap
@@ -550,6 +593,7 @@ class _SkseLaunch:
         for process in self.processes.values():
             process.close()
         self.processes.clear()
+        self.process_sequences.clear()
         self.lineage = None
 
     def reject(self, reason):
@@ -644,9 +688,11 @@ class _SkseLaunch:
                 raise ValueError("Skyrim had an unexpected parent")
             if exits[root.pid] is not None and game.created > exits[root.pid]:
                 raise ValueError("Skyrim started after the recorded SKSE launcher exited")
-        possible_launch_pids = {pid for pid, (_, name) in rows.items() if name.casefold() in paths}
-        possible_launch_pids.update(exits)
-        unresolved = self.lineage.observe(self.observer.identities(), possible_launch_pids, recover=checking_completion)
+        for process in self.processes.values():
+            if process.pid not in self.process_sequences:
+                self.process_sequences[process.pid] = self.observer.pinned_sequence(process)
+        survivors = self.lineage.observe(self.observer.identities(), self.process_sequences,
+                                         recover=checking_completion)
         evidence = [{"pid": process.pid, "created": process.created, "executable": process.executable,
                      "exited": exits[process.pid]} for process in self.processes.values()]
         instances = [{k: v for k, v in item.items() if k != "exited"} for item in evidence
@@ -655,12 +701,12 @@ class _SkseLaunch:
             if instances or evidence != callback_evidence:
                 raise ValueError("SKSE exit evidence changed during completion")
             if self.steam_start is not None:
-                self.steam_excluded = unresolved & self.steam_bootstrap.excluded(
+                self.steam_excluded = survivors & self.steam_bootstrap.excluded(
                     self.lineage, rows, root, self.steam_start)
-                unresolved.difference_update(self.steam_excluded)
+                survivors.difference_update(self.steam_excluded)
         for instance in instances:
             instance["children_observed"] = instance["pid"] == root.pid and game is not None
-        return instances, evidence, unresolved
+        return instances, evidence, survivors
 
     @property
     def paired(self):
@@ -921,7 +967,7 @@ class RunningApplications:
             record["completion_survivor_details"] = skse.lineage.survivor_details(record["completion_survivor_pids"])
             record["steam_bootstrap_excluded_pids"] = sorted(skse.steam_excluded)[:65]
             if survivors:
-                reason = "Waiting for surviving processes that could not be excluded from the SKSE launch"
+                reason = "Waiting for processes linked to the MO2 or SKSE launch"
                 record["first_uncertainty"] = record["first_uncertainty"] or reason
                 record["finish_uncertainty"] = reason
                 if not was_waiting:
@@ -957,7 +1003,7 @@ class RunningApplications:
                 "external_launches_certified": False, "pid_identity": "PID plus process creation time and full path",
                 "cancellation_observable": False, "arbitrary_descendant_tree_certified": False,
                 "skse_tracking": "standard managed Skyrim SE loader and directly launched game; "
-                                 "require verified exits at the finish callback and exclude surviving processes",
+                                 "require verified exits and check only launch-linked survivor generations",
                 "unconfirmed_policy": "block changes; no time-based expiry or guessed cancellation",
                 "restart_required_for_unobservable_canceled_launch": True,
                 "uncertainty": self.global_uncertainty,

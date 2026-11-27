@@ -43,20 +43,20 @@ class ProcessLineageTests(unittest.TestCase):
         third[22] = (21, 42)
         self.assertEqual(self.graph.observe(self.rows(third)), set())
 
-    def test_cofirst_parent_and_child_do_not_certify_the_child(self):
+    def test_cofirst_unrelated_parent_and_child_do_not_link_to_launch(self):
         current = self.rows({20: (1, 3), 21: (20, 1)})
-        self.assertEqual(self.graph.observe(current), {21})
+        self.assertEqual(self.graph.observe(current), set())
 
     def test_repeating_cofirst_snapshot_cannot_reconstruct_birth_order(self):
         current = self.rows({20: (1, 3), 21: (20, 1)})
         for _ in range(4):
-            self.assertEqual(self.graph.observe(current), {21})
+            self.assertEqual(self.graph.observe(current), set())
 
     def test_uncertified_child_cannot_certify_a_later_grandchild(self):
         current = self.rows({20: (1, 3), 21: (20, 1)})
-        self.assertEqual(self.graph.observe(current), {21})
+        self.assertEqual(self.graph.observe(current), set())
         current[22] = (21, 42)
-        self.assertEqual(self.graph.observe(current), {21, 22})
+        self.assertEqual(self.graph.observe(current), set())
 
     def test_owner_cannot_certify_new_children(self):
         self.assertEqual(self.graph.observe(self.rows({20: (OWNER, 3)})), {20})
@@ -74,16 +74,16 @@ class ProcessLineageTests(unittest.TestCase):
         self.assertEqual(self.graph.observe(self.rows(first)), {20, 21})
         self.assertEqual(self.graph.observe(self.rows(first)), {20, 21})
 
-    def test_one_unknown_survivor_blocks_among_many_external_children(self):
+    def test_unconnected_survivor_does_not_block_among_external_children(self):
         extra = {p: (1, 100 + p) for p in range(20, 70)}
         extra[80] = (999, 77)
-        self.assertEqual(self.graph.observe(self.rows(extra)), {80})
+        self.assertEqual(self.graph.observe(self.rows(extra)), set())
 
     def test_new_orphan_is_unknown(self):
-        self.assertEqual(self.graph.observe(self.rows({20: (999, 3)})), {20})
+        self.assertEqual(self.graph.observe(self.rows({20: (999, 3)})), set())
 
     def test_new_zero_parent_is_unknown(self):
-        self.assertEqual(self.graph.observe(self.rows({20: (0, 3)})), {20})
+        self.assertEqual(self.graph.observe(self.rows({20: (0, 3)})), set())
 
     def test_baseline_orphan_itself_does_not_count_as_new(self):
         initial = self.rows({30: (999, 77)})
@@ -101,11 +101,11 @@ class ProcessLineageTests(unittest.TestCase):
 
     def test_new_cycle_is_never_certified(self):
         current = self.rows({20: (21, 3), 21: (20, 1)})
-        self.assertEqual(self.graph.observe(current), {20, 21})
-        self.assertEqual(self.graph.observe(current), {20, 21})
+        self.assertEqual(self.graph.observe(current), set())
+        self.assertEqual(self.graph.observe(current), set())
 
     def test_self_parent_is_never_certified(self):
-        self.assertEqual(self.graph.observe(self.rows({20: (20, 3)})), {20})
+        self.assertEqual(self.graph.observe(self.rows({20: (20, 3)})), set())
 
     def test_prelaunch_stale_ppid_cycle_does_not_taint_existing_generations(self):
         initial = self.rows({30: (31, 77), 31: (30, 4)})
@@ -126,9 +126,9 @@ class ProcessLineageTests(unittest.TestCase):
         current[22] = (21, 42)
         self.assertEqual(self.graph.observe(current), set())
 
-    def test_new_child_of_a_now_missing_certified_parent_is_unknown(self):
+    def test_child_of_a_missing_unrelated_parent_has_no_launch_link(self):
         self.assertEqual(self.graph.observe(self.rows({20: (1, 3)})), set())
-        self.assertEqual(self.graph.observe(self.rows({21: (20, 1)})), {21})
+        self.assertEqual(self.graph.observe(self.rows({21: (20, 1)})), set())
 
     def test_reused_parent_generation_does_not_rebind_a_certified_old_child(self):
         self.assertEqual(self.graph.observe(self.rows({20: (1, 3)})), set())
@@ -139,15 +139,15 @@ class ProcessLineageTests(unittest.TestCase):
 
     def test_reused_baseline_parent_and_cofirst_child_are_not_baseline_certified(self):
         current = self.rows({1: (0, 3), 20: (1, 1)})
-        self.assertEqual(self.graph.observe(current), {1, 20})
+        self.assertEqual(self.graph.observe(current), set())
 
     def test_pid_reuse_is_new_even_with_same_parent_tuple(self):
         self.assertEqual(self.graph.observe(self.rows({20: (1, 3)})), set())
         self.assertEqual(self.graph.observe(self.rows()), set())
         self.assertEqual(self.graph.observe(self.rows({20: (OWNER, 1)})), {20})
 
-    def test_unknown_process_that_exits_no_longer_blocks(self):
-        self.assertEqual(self.graph.observe(self.rows({20: (999, 3)})), {20})
+    def test_mo2_child_that_exits_no_longer_blocks(self):
+        self.assertEqual(self.graph.observe(self.rows({20: (OWNER, 3)})), {20})
         self.assertEqual(self.graph.observe(self.rows()), set())
 
     def test_same_identity_disappearing_and_reappearing_is_contradictory(self):
@@ -207,14 +207,14 @@ class ProcessLineageTests(unittest.TestCase):
         self.assertEqual(self.graph.observe(current), set())
         current[22] = (21, 42)
         self.assertEqual(self.graph.observe(current), set())
-        self.assertEqual(self.graph.observe(current, related_pids={20}), {20, 21, 22})
+        self.assertEqual(self.graph.observe(current, related={20: 3}), {20, 21, 22})
         current.pop(20)
         self.assertEqual(self.graph.observe(current), {21, 22})
 
     def test_baseline_parent_related_detection_retracts_only_new_children(self):
         current = self.rows({20: (1, 3)})
         self.assertEqual(self.graph.observe(current), set())
-        self.assertEqual(self.graph.observe(current, related_pids={1}), {20})
+        self.assertEqual(self.graph.observe(current, related={1: 9000}), {20})
 
     def test_related_detection_also_covers_a_historical_parent_generation(self):
         current = self.rows({20: (1, 3)})
@@ -223,7 +223,7 @@ class ProcessLineageTests(unittest.TestCase):
         self.graph.observe(current)
         current.pop(20)
         self.assertEqual(self.graph.observe(current), set())
-        self.assertEqual(self.graph.observe(current, related_pids={20}), {21})
+        self.assertEqual(self.graph.observe(current, related={20: 3}), {21})
 
     def test_sequence_numeric_order_does_not_decide_ancestry(self):
         for sequence in (1, 5, 2**63 + 7):

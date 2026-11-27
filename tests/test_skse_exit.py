@@ -109,6 +109,9 @@ class FakeObserver:
     def pin_exited(self, pid, expected_path):
         return self.pin(pid)
 
+    def pinned_sequence(self, process):
+        return process.instance.sequence
+
     def pin(self, pid):
         self.calls.append(("pin", pid))
         if pid in self.pin_errors:
@@ -197,6 +200,35 @@ class SkseExitTests(unittest.TestCase):
         root, game = self.first_seen_game()
         self.assertFalse(self.finish_first_seen(root, game))
         self.assertTrue(any(h.pid == root.pid for h in self.observer.handles))
+        self.assertTrue(all(h.closed and h.close_calls == 1 for h in self.observer.handles))
+
+    def test_recovered_exited_loader_links_helper_seen_before_it_was_pinned(self):
+        self.guard.starting(LOADER)
+        earlier_snapshot = self.observer.snapshot()
+        root = self.observer.spawn(10, 1, LOADER)
+        game = self.observer.spawn(20, root.pid, GAME)
+        helper = self.observer.spawn(30, root.pid, OTHER)
+        self.observer.retained[root.pid] = root
+        self.observer.exit(root)
+        # Simulate Toolhelp and the identity API sampling across a short
+        # loader lifetime. The helper reaches the lineage scan before the
+        # game and its already-exited loader reach the handle checks.
+        self.observer.snapshot_override = earlier_snapshot
+        self.assertTrue(self.observe())
+        self.observer.snapshot_override = None
+        self.assertTrue(self.observe())
+        self.observer.exit(game)
+        self.guard.finished(LOADER, 0)
+        self.assertTrue(self.observe())
+        self.assertEqual(self.guard.describe()["launches"][0]["completion_survivor_pids"], [helper.pid])
+        self.observer.exit(helper)
+        self.assertFalse(self.observe())
+
+    def test_unavailable_pinned_generation_keeps_launch_unresolved(self):
+        root, game = self.first_seen_game()
+        with mock.patch.object(self.observer, "pinned_sequence", side_effect=ValueError("no sequence")):
+            self.assertTrue(self.finish_first_seen(root, game))
+        self.assertTrue(self.observe())
         self.assertTrue(all(h.closed and h.close_calls == 1 for h in self.observer.handles))
 
     def test_fast_loader_missing_parent_object_keeps_uncertainty(self):
@@ -331,13 +363,13 @@ class SkseExitTests(unittest.TestCase):
         self.assertTrue(self.observe(), "A live later descendant remains a blocker")
         self.observer.exit(late)
 
-    def test_new_detached_helper_cannot_be_ignored_at_normal_completion(self):
+    def test_new_process_with_no_launch_ancestry_does_not_block_completion(self):
         root, game = self.launch()
         helper = self.observer.spawn(40, 999, OTHER)
         self.observer.exit(root)
         self.observer.exit(game)
         self.guard.finished(LOADER, 0)
-        self.assertTrue(self.observe(), "A new unexplained detached process prevents complete-tree proof")
+        self.assertFalse(self.observe())
         self.assertIsNone(helper.ended)
 
     def test_preexisting_unconnected_orphan_does_not_prevent_normal_completion(self):
@@ -346,7 +378,7 @@ class SkseExitTests(unittest.TestCase):
         self.close_tree(root, game)
         self.assertIsNone(background.ended)
 
-    def test_detached_helper_appearing_in_final_rescan_blocks_completion(self):
+    def test_launch_linked_child_appearing_in_final_rescan_blocks_completion(self):
         root, game = self.launch()
         self.observer.exit(root)
         self.observer.exit(game)
@@ -355,16 +387,16 @@ class SkseExitTests(unittest.TestCase):
         def race():
             calls[0] += 1
             if calls[0] == 2:
-                # The process was born before this observation, but only the
-                # second global snapshot exposes its already-detached parent.
-                self.observer.spawn(40, 999, OTHER, created=self.observer.now - 1)
+                # The second snapshot exposes a child of the pinned game
+                # generation that was born before the game's exit.
+                self.observer.spawn(40, game.pid, OTHER, created=game.ended - 1)
             return original()
         with mock.patch.object(self.observer, "snapshot", side_effect=race):
             self.guard.finished(LOADER, 0)
         self.assertGreaterEqual(calls[0], 2)
-        self.assertTrue(self.observe(), "Final rescan must not discard a new detached helper")
+        self.assertTrue(self.observe())
 
-    def test_reused_prelaunch_orphan_pid_does_not_hide_a_new_detached_process(self):
+    def test_reused_unrelated_pid_does_not_create_a_launch_link(self):
         background = self.observer.spawn(40, 999, OTHER)
         root, game = self.launch()
         self.observer.exit(background)
@@ -373,7 +405,7 @@ class SkseExitTests(unittest.TestCase):
         self.observer.exit(root)
         self.observer.exit(game)
         self.guard.finished(LOADER, 0)
-        self.assertTrue(self.observe(), "Equal PID/parent/basename is not prelaunch creation identity")
+        self.assertFalse(self.observe())
 
     def test_dispatch_rejects_write_before_proof_and_enters_fake_write_after_proof(self):
         from mo2_codex_bridge.operations import Operations
@@ -400,12 +432,14 @@ class SkseExitTests(unittest.TestCase):
             files = sorted(q.name for q in (data / "backups" / result["backup_id"]).iterdir())
             self.assertEqual(files, ["before.json", "result.json"])
 
-    def test_missed_intermediary_parent_pid_reuse_cannot_hide_live_helper(self):
+    def test_observed_intermediary_parent_pid_reuse_cannot_hide_live_helper(self):
         self.observer.spawn(2, 1, r"C:\offline-lifecycle-fixture\explorer.exe")
         root, game = self.launch()
         self.observer.exit(root)
         intermediary = self.observer.spawn(30, game.pid, OTHER)
+        self.assertTrue(self.observe())
         helper = self.observer.spawn(40, intermediary.pid, OTHER + ".child.exe")
+        self.assertTrue(self.observe())
         self.observer.exit(intermediary)
         replacement_parent = self.observer.spawn(30, 2, OTHER + ".unrelated.exe")
         self.assertGreater(replacement_parent.created, helper.created)
@@ -434,14 +468,26 @@ class SkseExitTests(unittest.TestCase):
         self.guard.finished(LOADER, 0)
         self.assertTrue(self.observe())
 
-    def test_new_unrelated_surviving_process_still_blocks_conservative_completion(self):
+    def test_47_unrelated_survivors_do_not_hold_write_preflight(self):
+        from mo2_codex_bridge.operations import Operations
+
+        desktop = self.observer.spawn(2, 0, OTHER)
         root, game = self.launch()
-        unrelated = self.observer.spawn(40, 1, OTHER)
-        self.observer.exit(root)
-        self.observer.exit(game)
-        self.guard.finished(LOADER, 0)
-        self.assertTrue(self.observe(), "Unproved new process identity prevents complete exclusion of detached descendants")
-        self.assertIsNone(unrelated.ended)
+        external_parent = self.observer.spawn(30, desktop.pid, OTHER)
+        outsiders = [self.observer.spawn(pid, external_parent.pid, OTHER) for pid in range(100, 147)]
+        self.observer.birth_stamp = mock.Mock(side_effect=PermissionError("Unrelated process is not accessible"))
+        self.close_tree(root, game)
+        self.assertTrue(all(item.ended is None for item in outsiders))
+        self.observer.birth_stamp.assert_not_called()
+        with tempfile.TemporaryDirectory(prefix="offline-skse-unrelated-burst-") as folder:
+            ops = Operations(None, None, Path(folder), lambda: None)
+            ops.running = self.guard
+            ops.snapshot = mock.Mock(return_value={"profile": "Offline Test Profile", "revision": "fixture"})
+            ops.write_config = mock.Mock(return_value={"simulated": True})
+            result = ops.dispatch("write_config", {"expected_profile": "Offline Test Profile",
+                                                   "expected_revision": "fixture"})
+            self.assertTrue(result["simulated"])
+            ops.write_config.assert_called_once()
 
     def test_same_path_second_launch_is_still_blocked_after_one_tree_finishes(self):
         root, game = self.launch()
@@ -667,7 +713,7 @@ class SkseExitTests(unittest.TestCase):
         self.assertTrue(all(handle.closed and handle.close_calls == 1 for handle in self.observer.handles))
 
     def test_first_helpers_exit_does_not_hide_a_later_descendant(self):
-        helper = self.finish_with_survivor(parent=999)
+        helper = self.finish_with_survivor()
         child = self.observer.spawn(41, helper.pid, OTHER)
         self.observer.exit(helper)
         waiting = self.guard.describe()["launches"][0]
@@ -685,7 +731,7 @@ class SkseExitTests(unittest.TestCase):
             return None
         self.observer.birth_stamp = birth_stamp
 
-    def test_matching_exit_excludes_a_verified_same_poll_desktop_tree(self):
+    def test_matching_exit_does_not_probe_a_same_poll_desktop_tree(self):
         self.enable_exact_birth_probes()
         desktop = self.observer.spawn(2, 0, OTHER)
         root, game = self.launch()
@@ -696,7 +742,7 @@ class SkseExitTests(unittest.TestCase):
                              for call in self.observer.calls))
         self.close_tree(root, game)
         self.assertEqual(self.guard.describe()["launches"], [])
-        self.assertIn(("birth", 31), self.observer.calls)
+        self.assertNotIn(("birth", 31), self.observer.calls)
 
     def test_late_related_child_blocks_while_late_desktop_child_clears(self):
         self.enable_exact_birth_probes()

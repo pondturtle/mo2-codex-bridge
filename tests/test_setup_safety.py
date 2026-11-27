@@ -33,6 +33,7 @@ class SetupSafetyTests(unittest.TestCase):
         for name in setup.REQUIRED:
             (self.package / name).write_text("VERSION = " + repr(setup.VERSION) + '\n' if name == 'common.py' else '# new release ' + name + '\n', encoding='utf-8')
         (self.source / 'mcp_server.py').write_text('# fake server; never run\n')
+        (self.source / setup.CONNECTOR).write_bytes(b'fixture connector for configuration checks')
         self.destination = self.mo2 / 'plugins/mo2_codex_bridge'
         self.closed_calls = 0
     def closed(self):
@@ -192,10 +193,10 @@ class SetupSafetyTests(unittest.TestCase):
         with patch.object(setup.shutil, 'which', return_value='fake-codex-never-run'), patch.object(setup.subprocess, 'run', return_value=process):
             result = setup.configure(self.mo2, self.source, self.root / 'settings/config.json', register_codex=True)
         self.assertEqual(result['registration'], 'failed')
-        self.assertIn('exit 5', result['error'])
+        self.assertIn('registration could not be checked', result['error'])
         self.assertNotIn('private', json.dumps(result))
     def test_missing_client_server_does_not_generate_broken_registration(self):
-        (self.source / 'mcp_server.py').unlink()
+        (self.source / setup.CONNECTOR).unlink()
         result = setup.configure(self.mo2, self.source, self.root / 'settings/config.json')
         self.assertEqual(result['configuration'], 'failed')
         self.assertEqual(result['files_written'], [])
@@ -381,7 +382,7 @@ class SetupSafetyTests(unittest.TestCase):
         self.assertEqual(setup.inventory(self.destination), installed['staged_component'])
     def test_configuration_write_failure_does_not_rollback_component(self):
         installed = self.install()
-        with patch.object(setup, 'atomic_json', side_effect=PermissionError('fixture lock')):
+        with patch.object(setup, 'atomic_bytes', side_effect=PermissionError('fixture lock')):
             result = setup.configure(self.mo2, self.source, self.root / 'settings/config.json', register_codex=True)
         self.assertEqual(result['configuration'], 'failed')
         self.assertEqual(result['registration'], 'not attempted')

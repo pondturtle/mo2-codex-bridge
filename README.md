@@ -1,13 +1,13 @@
 # MO2 Codex Bridge
 
-Independent fork of [shadowpendant69/mo2-codex-bridge](https://github.com/shadowpendant69/mo2-codex-bridge). The current version is `0.1.3-local.8-candidate.7`. The upstream project and fork changes were developed with AI assistance. [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
+Independent fork of [shadowpendant69/mo2-codex-bridge](https://github.com/shadowpendant69/mo2-codex-bridge). The current version is `0.1.3-local.9-candidate.3`. The upstream project and fork changes were developed with AI assistance. [Changelog](CHANGELOG.md) · [MIT license](LICENSE)
 
 ## Why this fork exists
 
-This fork adds verified Nexus downloads through MO2, mod placement and renaming, and read-only backup and profile inventories. It also fixes bugs in launch tracking, mod operations, and recovery.
+This fork adds verified Nexus downloads through MO2, mod placement and renaming, and read-only previews and inventories. It also fixes bugs in launch tracking, mod operations, and recovery.
 
-- **SKSE exit tracking.** Keeps writes blocked while Skyrim or a related tool may still be running. After a verified exit, waits only for processes linked to the launch. Steam can stay open.
-- **Download recovery.** Reports when a canceled download leaves no archive, allows one explicitly approved retry, and rejects a retry if the original archive is still present.
+- **SKSE exit tracking.** Keeps writes blocked while Skyrim or a related tool may still be running. After verified exits, waits for processes linked to the launch. Steam can stay open. The guard also tracks MO2-launched command wrappers and direct tools by process identity.
+- **Download recovery.** Reports when a canceled download leaves no archive, allows one explicitly approved retry, and rejects a retry if the original archive is still present. Automatic Premium starts and retries share a minimum five-second interval.
 - **Interrupted requests.** Keeps job records across restarts. If an install or write times out, you can look up the original job without running the operation again.
 - **Configuration and load-order recovery.** Checks the target profile, backup integrity, and dependency order before restoring. Preserves configuration file encoding and saves a recovery copy before applying a restore.
 - **Mod installs, updates, and removals.** Preserves the relative order of existing plugins in supported installs and keeps optional plugins disabled during supported updates. Checks that MO2 saved the expected lists after a removal.
@@ -51,6 +51,12 @@ An existing chat can retain an older tool list after its connector is updated. C
 
 Native backup creation and restore, archive-content and plugin-record conflict analysis, and physical hiding of ESP/ESM/ESL files remain outside the supported operations.
 
+## Read-only previews and archive lookup
+
+- `preview_optional_plugin` accepts `plugin`, the exact visible filename. It reports the current provider, same-name indexed alternatives, masters, active dependents, and game-forced activation. The report covers the current profile's plugin evidence.
+- `nexus_find_archive` accepts an exact Nexus file `url` or a mod URL with `file_id`. When it reports `checking_archive`, repeat the same request for the result. A verified match pairs readable local MO2 metadata with the archive's local SHA-256. Ambiguous, incomplete, and unidentified files yield no archive path.
+- `preview_mod_replacement` accepts the exact active `mod` and exact disabled `replacement` already staged in MO2. It models placing the replacement immediately before the active mod and switching between them. The report covers projected plugin providers, masters, flags, and enabled states. New plugin defaults remain unknown. Conflicting evidence blocks the forecast.
+
 ## Preview, place, and rename
 
 Use preview_mod_change with action place_mod, the exact mod and anchor names, and position before or after. The preview shows the left-pane change in the active profile. Moves that could switch a plugin provider are refused. Loose-file winners can change as priorities change.
@@ -65,6 +71,12 @@ Apply the same arguments with the preview's plan_token, expected_profile, and ex
 2. After the user selects one file, call `nexus_download` with its file URL or a mod URL plus `file_id`, a fresh profile and revision, and `mode` set to `premium` or `manual`. Premium mode uses MO2's verified Premium account for eligible files. Manual mode returns the exact Nexus page so the user can choose **Mod Manager Download**. Start manual tracking before clicking. If file eligibility is pending, repeat the same request once its metadata is ready.
 3. Keep the `download_id` and call `nexus_download_status` to check the original request. Resume an interrupted transfer through MO2. The bridge keeps the reservation across chat or MO2 restarts and submits the exact file at most once. It returns the local archive, byte count, and SHA-256 only after checking new matching download evidence. Review the archive separately before installing it.
 
+Automatic Premium starts and retries share a minimum five-second interval in one MO2 instance. After the first handoff, the bridge waits for fresh evidence that the exact previous transfer began. A matching nonempty partial or completed archive can provide that evidence, so transfers can overlap.
+
+- `waiting_for_previous_download` gives the previous attempt's ID. Check that ID and the MO2 queue. A failed or unresolved start stops the batch. A confirmed `no_archive` result or an explicitly approved retry follows the existing recovery rules.
+- `download_paced` gives `retry_after_seconds`. After the wait, repeat the same approved request with a current profile and revision. The bridge checks the previous transfer again before submitting.
+- `rate_limited` gives `retry_after_seconds` when the public Nexus catalog supplies a usable Retry-After. MO2's native download interface does not expose that header. The bridge schedules no automatic submission or retry.
+
 Use the matching bridge component and client to expose these actions. Public listings use the official Nexus catalog. Account credentials and the actual transfer stay with MO2 and the browser. When the public catalog is unavailable, select the file on the Nexus site and use manual handoff. [Nexus GraphQL catalog](https://graphql.nexusmods.com/#query-modFiles)
 
 If MO2's queue is confirmed idle and the archive is absent, `nexus_download_status` reports `no_archive`. The status can apply after cancellation, failure, or removal. After explicit user approval, use `nexus_download_retry` with the previous `download_id` and fresh profile and revision. MO2 must be the sole open instance and its Downloads list must be clear of unfinished transfers. The bridge checks the exact file again and reserves one successor ID. Repeating that retry returns the same successor. Follow `next_download_id` when an older receipt reports `superseded`.
@@ -77,8 +89,10 @@ Shared mod folders can affect every profile. Use fresh profile and revision chec
 
 After verified SKSE and Skyrim exits, MO2 2.5.2 can leave its unhooked Steam client and verified Steam WebHelpers running. The guard requires the registered installation path, exact process generations, and the expected launch order. Every other survivor retains its ordinary guard checks.
 
+For tools launched directly by MO2 2.5.2 on Windows with process-sequence support, the guard records the exact executable instance. It requires a verified exit and a matching MO2 finish callback, then waits for any observed descendants or unresolved process ancestry. Existing same-path processes and processes with verified unrelated ancestry are excluded. This covers command wrappers and direct tools such as DynDOLOD and TexGen. A missed root, an ambiguous launch, or a substituted executable that changes the callback path can still leave the guard active.
+
 The bridge uses authenticated localhost requests. Keep session configuration, audit logs and recovery files private. See [agent guidance](AGENTS.md) for operating details.
 
-Run `python -B -m unittest discover -s tests -v` in a fixture workspace. All 730 tests passed on both Windows Python 3.13 and 3.15. Live MO2 2.5.2 checks verified the connector upgrade, a read-only Nexus lookup in a resumed Work chat, and write refusal during Skyrim play followed by clearance after exit with Steam still open. The free-account download flow awaits live verification.
+Run `python -B -m unittest discover -s tests -v` in a fixture workspace. All 813 tests passed on both Windows Python 3.13 and 3.15. Live MO2 2.5.2 checks verified Premium download pacing across four exact archives. Earlier live checks verified the three read-only actions and guard recovery after command wrappers and direct tools, including Reqtificator and SSEEdit. The free-account download flow awaits live verification.
 
 To remove the bridge, close MO2, preserve its recovery files, remove the bridge component under `plugins`, and remove the connector registration.

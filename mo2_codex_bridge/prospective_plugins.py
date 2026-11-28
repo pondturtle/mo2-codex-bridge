@@ -6,37 +6,64 @@ from pathlib import Path
 
 from .common import contained_path, safe_name
 from .order_recovery import validate_plugin_state
+from .nexus_archive import _stable_read
+from .profile_usage import _bounded, _plain_name, _safe_stat
 
 _SUFFIXES = {'.esp','.esm','.esl'}
 
 
-def read_headers(ops, name):
+def _header_bytes(stream, file_bytes, name, budget):
+    header = stream.read(24)
+    if len(header) != 24 or header[:4] != b'TES4':
+        raise ValueError('New plugin has no valid Skyrim TES4 header: ' + name)
+    size = int.from_bytes(header[4:8], 'little')
+    if not 18 <= size <= 16 * 1024 * 1024 or file_bytes < 24 + size:
+        raise ValueError('New plugin header size is invalid: ' + name)
+    if budget is not None and 24 + size > budget:
+        raise ValueError('Replacement plugin headers exceed the preview read limit')
+    body = stream.read(size)
+    if len(body) != size:
+        raise ValueError('New plugin header is incomplete: ' + name)
+    return header, body
+
+
+def read_headers(ops, name, *, preview=False):
     mod = ops.mod(name, writable=True)
     root = contained_path(ops.o.modsPath(), name)
     if root != Path(mod.absolutePath()).resolve() or not root.is_dir():
         raise ValueError('New mod folder identity cannot be proved')
     result = {}
-    for path in sorted(root.iterdir(),key=lambda item:item.name.casefold()):
+    entries = root.iterdir()
+    remaining = None
+    if preview:
+        _safe_stat(root, directory=True)
+        entries = _bounded(entries, 4096, 'Replacement root entries')
+        remaining = 8 * 1024 * 1024
+    for path in sorted(entries, key=lambda item: item.name.casefold()):
         if path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction()):
             raise ValueError('Linked new mod contents prevent activation proof')
         if path.suffix.casefold() not in _SUFFIXES:
             continue
         if not path.is_file():
             raise ValueError('Ambiguous plugin entry prevents activation proof')
-        before = path.stat()
-        with path.open('rb') as stream:
-            header = stream.read(24)
-            if len(header)!=24 or header[:4]!=b'TES4':
-                raise ValueError('New plugin has no valid Skyrim TES4 header: ' + path.name)
-            size = int.from_bytes(header[4:8],'little')
-            if not 18 <= size <= 16*1024*1024 or before.st_size < 24+size:
-                raise ValueError('New plugin header size is invalid: ' + path.name)
-            body = stream.read(size)
-        if len(body)!=size:
-            raise ValueError('New plugin header is incomplete: ' + path.name)
-        after = path.stat()
-        if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
-            raise ValueError('New plugin changed during activation preflight')
+        if preview:
+            if not _plain_name(path.name):
+                raise ValueError('A replacement plugin has an invalid file name')
+            if _safe_stat(path).st_nlink != 1:
+                raise ValueError('A hard-linked replacement plugin cannot be previewed: ' + path.name)
+            # Reuse the read-only Windows handle proof, including leaf reparse
+            # and hard-link rejection, without reading the whole plugin.
+            with _stable_read(path, 4 * 1024 ** 3) as (stream, size):
+                header, body = _header_bytes(stream, size, path.name, remaining)
+                after = os.fstat(stream.fileno())
+            remaining -= len(header) + len(body)
+        else:
+            before = path.stat()
+            with path.open('rb') as stream:
+                header, body = _header_bytes(stream, before.st_size, path.name, None)
+            after = path.stat()
+            if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
+                raise ValueError('New plugin changed during activation preflight')
         flags = int.from_bytes(header[8:12],'little')
         if int.from_bytes(header[12:16],'little')!=0 or flags&0x40000:
             raise ValueError('New plugin TES4 identity/compression is unsupported: ' + path.name)
@@ -74,6 +101,8 @@ def read_headers(ops, name):
                     master = value[:-1].decode('cp1252')
                 if not master or any(character in master for character in '/\\:') or Path(master).suffix.casefold() not in _SUFFIXES:
                     raise ValueError('Invalid master filename identity: ' + path.name)
+                if preview and (not _plain_name(master) or len(masters) >= 512):
+                    raise ValueError('A replacement plugin has invalid or excessive master names: ' + path.name)
                 masters.append(master)
                 pending_master = True
             elif signature==b'DATA' and pending_master:
@@ -93,7 +122,7 @@ def read_headers(ops, name):
     return result
 
 
-def comparison_mods(ops, mods, proofs=None):
+def comparison_mods(ops, mods, proofs=None, *, saved_modlist=None):
     """Canonicalize only a proved stale UTF-8/CP1252 API-cache spelling.
 
     The raw folder must be absent before the operation, while the unique
@@ -119,7 +148,8 @@ def comparison_mods(ops, mods, proofs=None):
             target = contained_path(ops.o.modsPath(),decoded)
             if not target.is_dir():
                 raise ValueError('Cached mod spelling has no canonical folder proof')
-            text = (Path(ops.o.profilePath())/'modlist.txt').read_text(encoding='utf-8-sig')
+            text = (saved_modlist.decode('utf-8-sig') if saved_modlist is not None else
+                    (Path(ops.o.profilePath())/'modlist.txt').read_text(encoding='utf-8-sig'))
             entries = [line[1:] for line in text.splitlines() if line[:1] in {'+','-','*'}]
             if entries.count(decoded) != 1 or item['name'] in entries:
                 raise ValueError('Cached mod spelling lacks a unique saved profile entry')

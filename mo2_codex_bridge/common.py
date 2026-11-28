@@ -6,7 +6,7 @@ import re
 import tempfile
 from pathlib import Path
 
-VERSION = '0.1.3-local.8-candidate.7'
+VERSION = '0.1.3-local.9-candidate.3'
 TEXT_EXTENSIONS = {'.ini', '.json', '.toml', '.xml', '.txt', '.yaml', '.yml', '.cfg'}
 PROTECTED = {'meta.ini', 'modlist.txt', 'plugins.txt', 'loadorder.txt', 'archives.txt',
              'lockedorder.txt', 'settings.ini', 'modorganizer.ini'}

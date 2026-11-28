@@ -372,12 +372,85 @@ def capture_retry_baseline(downloads_root, target, previous_baseline, *, expecte
             "_directory_proof": before}
 
 
+def observe_nexus_transfer_start(downloads_root, target, baseline, *, cancelled=None):
+    """Observe new exact MO2 transfer evidence without opening either payload."""
+    try:
+        _check_cancelled(cancelled)
+        selector = _selector(target)
+        root, identity = _matching_root(downloads_root, baseline)
+        before = _directory_signature(root, identity)
+        previous = set(baseline["names"])
+        files, rows = _scan(root, selector, cancelled=cancelled, previous_names=previous)
+        if len(rows) != 1:
+            return False
+        key, (_, ready) = next(iter(rows.items()))
+        if key in previous:
+            return False
+
+        payload_key = key if ready else key + _UNFINISHED
+        meta_key = payload_key + _META
+        if (payload_key not in files or meta_key not in files
+                or (not ready and (key in files or key + _META in files))):
+            return False
+        name = files[payload_key]
+        if not _plain_filename(name):
+            return False
+        payload = root / name
+        first = _file_info(payload)
+        if not 0 < first.st_size <= _MAX_ARCHIVE_BYTES:
+            return False
+        if ready and target.get("size_bytes") not in (None, first.st_size):
+            return False
+
+        # Read the sidecar briefly before and after looking for competing
+        # evidence so MO2 can update its metadata while the scan runs.
+        meta = root / files[meta_key]
+        values = _read_meta(meta, [_MAX_META_BYTES])
+        if (not _matches(values, selector)
+                or values.get("paused") != "false" or values.get("removed") != "false"):
+            return False
+        if _scan(root, selector, cancelled=cancelled, previous_names=previous) != (files, rows):
+            return False
+        if _read_meta(meta, [_MAX_META_BYTES]) != values:
+            return False
+
+        last = _file_info(payload)
+        if ready:
+            if _fingerprint(last) != _fingerprint(first):
+                return False
+        elif ((last.st_dev, last.st_ino) != (first.st_dev, first.st_ino)
+              or not first.st_size <= last.st_size <= _MAX_ARCHIVE_BYTES):
+            return False
+        _check_cancelled(cancelled)
+        return _directory_signature(root, identity) == before
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def inspect_nexus_archive(downloads_root, target, baseline, *, cancelled=None):
     """Read the exact new final archive and return a stable local SHA-256."""
     try:
         return _inspect_archive(downloads_root, target, baseline, cancelled)
     except _VerificationCancelled:
         return _result("cancelled", "Archive verification was interrupted while the bridge closed.")
+
+
+def inspect_existing_nexus_archive(downloads_root, target, *, cancelled=None):
+    """Identify a completed local archive without attributing it to a bridge request."""
+    try:
+        _check_cancelled(cancelled)
+        root, identity = _root(downloads_root)
+        # This scan is explicitly for existing files. It has no pre-request names
+        # and never creates or updates a download reservation.
+        baseline = {"root": str(root), "root_identity": identity, "names": []}
+        result = _inspect_archive(root, target, baseline, cancelled)
+        if result["status"] == "waiting":
+            result = _result("not_found", "No local archive with matching readable MO2 Nexus metadata was found.")
+        return baseline, result
+    except _VerificationCancelled:
+        return None, _result("cancelled", "Archive verification was interrupted while the bridge closed.")
+    except (OSError, ValueError):
+        return None, _result("unverified", "MO2's Downloads directory could not be checked safely.")
 
 
 def _inspect_archive(downloads_root, target, baseline, cancelled):

@@ -2,6 +2,24 @@
 
 Each entry compares a published version with the previous published version.
 
+## 0.1.3-local.9-candidate.3
+
+Changes since `0.1.3-local.8-candidate.7`.
+
+### Added
+
+- Preview an optional plugin's provider, masters, and active dependents.
+- Find an existing archive by exact Nexus file ID and verify it using MO2's local metadata and SHA-256.
+- Preview how a staged mod replacement would affect plugin providers, masters, and activation.
+
+### Changed
+
+- Automatic Premium Nexus download starts and retries share a five-second minimum interval per MO2 instance. The bridge confirms the previous transfer started before timing the gap. Transfers can overlap. A valid `Retry-After` from the public Nexus catalog delays further submissions.
+
+### Fixed
+
+- The write guard clears after verified exits of MO2-launched command wrappers and direct tools. Unrelated processes that were already open no longer hold the guard. Related processes and unresolved launches still block writes.
+
 ## 0.1.3-local.8-candidate.7
 
 Changes since `0.1.3-local.8-candidate.5`.

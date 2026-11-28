@@ -1,10 +1,12 @@
 """Public file metadata via the official Nexus GraphQL API."""
+from email.utils import format_datetime, parsedate_to_datetime
 import http.client
 import json
+import math
 import re
 import socket
 from threading import Timer
-from time import monotonic
+from time import monotonic, time
 
 from .common import VERSION
 from .nexus_links import _game_text, _id
@@ -16,6 +18,7 @@ _MAX_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 5000
 _TIMEOUT = 12
 _NUMERIC_TEXT = re.compile(r"[0-9]{1,19}")
+_BACKOFF_STATUSES = {429, 503}
 
 # https://graphql.nexusmods.com/#query-game
 _GAME_QUERY = """
@@ -40,6 +43,47 @@ query BridgeFiles($gameId: ID!, $modId: ID!) {
 
 class PublicCatalogError(ValueError):
     """The requested public Nexus catalog could not be verified."""
+
+
+class PublicCatalogBackoff(PublicCatalogError):
+    """Nexus returned a valid wait for a later request."""
+
+    def __init__(self, retry_after_seconds):
+        if type(retry_after_seconds) is not int or retry_after_seconds < 0:
+            raise ValueError("Invalid Nexus catalog wait")
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("Nexus asked the bridge to wait before requesting its public file catalog again")
+
+
+def _http_date(value):
+    # Accept the canonical HTTP date, with UTC and a matching weekday.
+    if len(value) != 29:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None or format_datetime(parsed, usegmt=True) != value:
+            return None
+        return parsed.timestamp()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _retry_after(response):
+    headers = response.getheaders()
+    values = [value.strip(" \t") for name, value in headers if name.casefold() == "retry-after"]
+    if len(values) != 1:
+        return None
+    retry_after = values[0]
+    if _NUMERIC_TEXT.fullmatch(retry_after):
+        return int(retry_after)
+    deadline = _http_date(retry_after)
+    if deadline is None:
+        return None
+    dates = [value.strip(" \t") for name, value in headers if name.casefold() == "date"]
+    server_clock = _http_date(dates[0]) if len(dates) == 1 else None
+    # The server's Date can protect the requested interval from a fast local clock.
+    earliest_clock = min(time(), server_clock) if server_clock is not None else time()
+    return max(0, math.ceil(deadline - earliest_clock))
 
 
 def _remaining(deadline):
@@ -93,6 +137,10 @@ def _graph(query, variables, deadline):
         connection.request("POST", _PATH, body, headers)
         with connection.getresponse() as response:
             if response.status != 200:
+                if response.status in _BACKOFF_STATUSES:
+                    delay = _retry_after(response)
+                    if delay is not None:
+                        raise PublicCatalogBackoff(delay)
                 raise PublicCatalogError("Nexus did not return a public file catalog")
             mime = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
             encoding = response.getheader("Content-Encoding", "identity").lower()

@@ -7,10 +7,12 @@ from unittest.mock import Mock, patch
 
 import mcp_server
 import setup
+from client import MUTATING_ACTIONS
 import test_client_recovery as existing
 from mo2_codex_bridge import operations
 
-ACTIONS = {"native_mod_backups", "mod_profile_usage"}
+ACTIONS = {"native_mod_backups", "mod_profile_usage", "preview_optional_plugin",
+           "nexus_find_archive", "preview_mod_replacement"}
 
 
 class FeatureInspectionTests(unittest.TestCase):
@@ -23,6 +25,7 @@ class FeatureInspectionTests(unittest.TestCase):
         self.assertTrue(ACTIONS <= read)
         self.assertTrue(ACTIONS.isdisjoint(write))
         self.assertTrue(ACTIONS.isdisjoint(operations.WRITE_ACTIONS))
+        self.assertTrue(ACTIONS.isdisjoint(MUTATING_ACTIONS))
         self.assertEqual(read - {"installer_state"}, operations.READ_ACTIONS)
         self.assertTrue(inspect["annotations"]["readOnlyHint"])
 
@@ -86,10 +89,11 @@ class FeatureInspectionTests(unittest.TestCase):
             self.assertNotIn("backup_id", failure)
             self.assertEqual(list(data.iterdir()), [])
 
-    def test_component_setup_validates_both_feature_modules_in_candidate_payload(self):
+    def test_component_setup_includes_all_inspection_modules(self):
         candidate = Path(__file__).resolve().parents[1]
         payload = setup.source_payload(candidate)
-        for name in ("native_backups.py", "profile_usage.py"):
+        for name in ("native_backups.py", "profile_usage.py",
+                     "optional_plugin_preview.py", "replacement_preview.py"):
             self.assertIn(name, setup.REQUIRED)
             self.assertEqual(payload[name], (candidate / "mo2_codex_bridge" / name).read_bytes())
 
@@ -108,13 +112,22 @@ class FeatureReadQueueTests(unittest.TestCase):
         owner.organizer.pluginSetting = Mock(side_effect=AssertionError("Read consulted write permission"))
         owner.ops = operations.Operations(None, None, owner.data, None)
         owner.ops.running = {"SkyrimSE.exe"}
+        owner.ops.nexus = Mock()
+        owner.ops.nexus.find_archive.return_value = {"status": "checking_archive"}
         with (
             patch.object(operations, "browse_native_mod_backups", return_value={"backups": []}),
             patch.object(operations, "report_mod_profile_usage", return_value={"profiles": []}),
+            patch.object(operations, "preview_optional_plugin", return_value={"plugin": "Fixture.esp"}),
+            patch.object(operations, "preview_mod_replacement", return_value={"status": "modeled"}),
         ):
             for action in sorted(ACTIONS):
                 ident = action.replace("_", "-")
-                params = {"mod": "Example Mod"} if action == "mod_profile_usage" else {}
+                params = {
+                    "mod_profile_usage": {"mod": "Example Mod"},
+                    "preview_optional_plugin": {"plugin": "Fixture.esp"},
+                    "preview_mod_replacement": {"mod": "Example Mod", "replacement": "Staged"},
+                    "nexus_find_archive": {"url": "https://www.nexusmods.com/skyrimspecialedition/mods/1?file_id=2"},
+                }.get(action, {})
                 self.assertEqual(owner.enqueue({"action": action, "params": params,
                                                 "request_id": ident})["status"], "queued")
                 self.assertFalse(owner.jobs[ident]["_mutation"])

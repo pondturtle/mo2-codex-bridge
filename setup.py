@@ -25,7 +25,7 @@ MAX_CONNECTOR_BYTES = 16 * 1024 * 1024
 REQUIRED = {'__init__.py', 'common.py', 'dialogs.py', 'operations.py', 'persistence.py', 'plugin.py', 'transport.py',
             'config_recovery.py', 'mod_persistence.py', 'order_recovery.py', 'configuration_encoding.py',
             'managed_operations.py', 'job_store.py', 'running_apps.py', 'steam_bootstrap.py',
-            'native_backups.py', 'profile_usage.py', 'nexus_links.py', 'nexus_catalog.py',
+            'native_backups.py', 'profile_usage.py', 'optional_plugin_preview.py', 'replacement_preview.py', 'nexus_links.py', 'nexus_catalog.py',
             'nexus_native.py', 'nexus_archive.py', 'nexus_downloads.py',
             'mod_change_previews.py', 'mod_placement.py', 'planned_profile_state.py',
             'mod_rename.py', 'native_rename_model.py'}

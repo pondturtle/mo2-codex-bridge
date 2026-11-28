@@ -2,8 +2,8 @@
 
 MO2 2.5.2 supplies neither PID nor a canceled/failed-start callback. A pending
 attempt is therefore never cleared merely by elapsed time or an empty scan.
-Only finished callbacks discharge attempts; read-only Windows observations keep
-other exact executable instances guarded even if one callback completes.
+Only finished callbacks discharge attempts. Native Skyrim and direct tool
+tracking tie completion to specific Windows process generations.
 """
 import ctypes
 import ntpath
@@ -83,6 +83,12 @@ class _ProcessHandle:
             raise OSError("Process exit time did not match its recorded identity")
         return exited
 
+    def exit_code(self):
+        code = wintypes.DWORD()
+        if not self.kernel.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return code.value
+
     def close(self):
         if self.handle is not None:
             handle, self.handle = self.handle, None
@@ -108,6 +114,10 @@ class _ProcessTelemetryHeader(ctypes.Structure):
                 ("interrupt_time", ctypes.c_uint64), ("unbiased_time", ctypes.c_uint64),
                 ("sequence", ctypes.c_uint64), ("session_created", ctypes.c_uint64),
                 ("session_id", wintypes.ULONG), ("boot_id", wintypes.ULONG)]
+
+
+class _ProcessSequencesUnsupported(OSError):
+    """The Windows kernel does not implement the process sequence query."""
 
 
 class WindowsProcessObserver:
@@ -143,6 +153,8 @@ class WindowsProcessObserver:
         kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
         kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
         kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel.CloseHandle.restype = wintypes.BOOL
         kernel.GetSystemTimePreciseAsFileTime.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
@@ -177,6 +189,8 @@ class WindowsProcessObserver:
             if status in (0xc0000004, 0xc0000023):  # Buffer too small.
                 size = max(size * 2, returned.value)
                 continue
+            if status in (0xc0000002, 0xc0000003, 0xc00000bb):
+                raise _ProcessSequencesUnsupported("Windows does not support process sequence snapshots")
             if status != 0:
                 raise OSError(f"Windows process sequence snapshot unavailable (0x{status:08x})")
             if returned.value > size:
@@ -381,7 +395,7 @@ class _ProcessLineage:
     _MAX_SEQUENCES = 65536
     _MAX_BIRTH_QUERIES = 32
 
-    def __init__(self, owner_pid, baseline, birth_stamp=None):
+    def __init__(self, owner_pid, baseline, birth_stamp=None, *, pinned_only=False):
         self.owner_pid = owner_pid
         self.baseline = dict(baseline)
         self.previous = {}
@@ -395,8 +409,12 @@ class _ProcessLineage:
         self._unresolved_reasons = {}
         self.protected_sequences = set()
         self._owner_sequences = set()
+        self._unresolved_roots = set()
+        self._track_unresolved_parents = pinned_only
 
         self.observe(baseline)
+        if pinned_only:
+            return
         # Only the exact MO2 generation and its observed starting subtree
         # can link an MO2-spawned branch to this launch. The baseline
         # processes themselves do not count as new survivors.
@@ -446,7 +464,7 @@ class _ProcessLineage:
                     self._possible_parents.setdefault(sequence, set()).add(newly_pinned[parent])
                 continue
             if len(self.seen) >= self._MAX_SEQUENCES:
-                raise ValueError("SKSE process ancestry history reached its capacity")
+                raise ValueError("Launch process ancestry history reached its capacity")
             self.seen[sequence] = fingerprint
             if parent == pid:
                 continue
@@ -468,6 +486,11 @@ class _ProcessLineage:
                     possible.add(related[parent])
                 if possible:
                     self._possible_parents[sequence] = possible
+                elif self._track_unresolved_parents and parent > 0 and self.baseline.get(pid) != (parent, sequence):
+                    # A helper can outlive a parent that started and exited
+                    # between samples. A newly seen orphan has unresolved
+                    # launch ancestry even after the pinned wrapper exits.
+                    self._unresolved_roots.add(sequence)
         self.previous = dict(rows)
         scoped = self._launch_sequences()
         if recover:
@@ -483,7 +506,7 @@ class _ProcessLineage:
         for child, parents in self._possible_parents.items():
             for parent in parents:
                 children.setdefault(parent, []).append(child)
-        related = self._owner_sequences | self.protected_sequences
+        related = self._owner_sequences | self.protected_sequences | self._unresolved_roots
         pending = list(related)
         while pending:
             for child in children.get(pending.pop(), ()):
@@ -563,11 +586,16 @@ class _ProcessLineage:
             if reason is None:
                 ancestor = sequence
                 visited = set()
-                while ancestor in self.parent_links and ancestor not in roots and ancestor not in visited:
+                while (ancestor in self.parent_links and ancestor not in roots
+                       and ancestor not in self._unresolved_roots and ancestor not in visited):
                     visited.add(ancestor)
                     ancestor = self.parent_links[ancestor]
-                reason = ("Ancestry leads to a tracked MO2 or Skyrim process" if ancestor in roots
-                          else "A process linked to this launch has an unconfirmed parent generation")
+                if ancestor in self._unresolved_roots:
+                    reason = "A new process has no observed parent generation"
+                elif ancestor in roots:
+                    reason = "Ancestry leads to a tracked launch process"
+                else:
+                    reason = "A process linked to this launch has an unconfirmed parent generation"
             details.append({"pid": pid, "parent_pid": parent, "reason": reason})
         return details
 
@@ -713,6 +741,116 @@ class _SkseLaunch:
         return len(self.processes) == 2
 
 
+class _DirectLaunch:
+    """Track an exact executable spawned directly by MO2 and its observed tree."""
+
+    def __init__(self, observer, executable):
+        self.observer = observer
+        self.executable = executable
+        self.basename = ntpath.basename(executable)
+        self.subject = "command wrapper" if self.basename == "cmd.exe" else "direct tool"
+        self.lineage = None
+        self.before_launch = None
+        self.root = None
+        self.sequence = None
+        self.finished_at = None
+        self.exit_evidence = None
+        self.problem = None
+        self.rapid_until = 0
+
+    def start(self):
+        rows = self.observer.identities()
+        self.lineage = _ProcessLineage(self.observer.owner_pid, rows,
+                                       getattr(self.observer, "birth_stamp", None), pinned_only=True)
+        self.before_launch = self.observer.clock()
+        if type(self.before_launch) is not int or self.before_launch <= 0:
+            raise ValueError("Windows launch time is unavailable")
+        # Improve early capture of short tools. The time window only changes polling cadence.
+        self.rapid_until = time.monotonic() + 2
+
+    def close(self):
+        if self.root is not None:
+            self.root.close()
+            self.root = None
+        self.lineage = None
+
+    def observe(self):
+        owner = self.observer.owner_pid
+        rows = self.observer.identities()
+        if rows.get(owner) != self.lineage.baseline[owner]:
+            raise ValueError("The MO2 process generation changed")
+        candidates = {pid: sequence for pid, (parent, sequence) in rows.items()
+                      if parent == owner and self.lineage.baseline.get(pid) != (parent, sequence)
+                      and (self.root is None or self.root.pid != pid)}
+        if candidates:
+            self._pin_root(candidates, owner)
+        root = self.root
+        if root is None:
+            self.lineage.observe(rows)
+            return [], [], set()
+
+        exited = root.exit_time()
+        if exited is None and root.pid not in rows:
+            raise ValueError(f"The pinned {self.subject} is missing from the Windows snapshot")
+        if self.finished_at is not None and (exited != self.exit_evidence["exited"]
+                                             or exited > self.finished_at):
+            raise ValueError(f"The {self.subject} exit evidence changed")
+        survivors = self.lineage.observe(rows, {root.pid: self.sequence},
+                                         recover=self.finished_at is not None)
+        survivors.discard(root.pid)
+        evidence = {"pid": root.pid, "created": root.created, "executable": root.executable,
+                    "exited": exited}
+        instances = [{key: value for key, value in evidence.items() if key != "exited"}] if exited is None else []
+        if instances:
+            instances[0]["children_observed"] = bool(survivors)
+        return instances, [evidence], survivors
+
+    def _pin_root(self, candidates, owner):
+        snapshot = self.observer.snapshot()
+        checked_at = self.observer.clock()
+        if type(checked_at) is not int or checked_at < self.before_launch:
+            raise ValueError(f"The Windows clock changed during {self.subject} observation")
+        for pid, sequence in candidates.items():
+            row = snapshot.get(pid)
+            if row is None or row[1].casefold() != self.basename:
+                continue
+            process = self.observer.pin(pid)
+            keep = False
+            try:
+                if path_key(process.executable) != self.executable:
+                    continue
+                if (row[0] != owner or process.pid != pid or type(process.created) is not int
+                        or not self.before_launch < process.created <= checked_at
+                        or self.observer.pinned_sequence(process) != sequence):
+                    raise ValueError(f"The {self.subject} identity does not match the MO2 launch")
+                if self.root is not None:
+                    raise ValueError(f"Multiple exact {self.subject}s could match the MO2 launch")
+                self.root, self.sequence = process, sequence
+                keep = True
+            finally:
+                if not keep:
+                    process.close()
+
+    def confirm_finish(self, exit_code):
+        if (type(exit_code) is not int or not -0x80000000 <= exit_code <= 0xffffffff
+                or exit_code in {259, -1, 0xffffffff}):
+            raise ValueError(f"MO2 did not report a terminal {self.subject} exit code")
+        if self.root is None:
+            raise ValueError(f"The {self.subject} was not pinned to the MO2 launch before finish")
+        # Read the retained handle before another Windows process scan can
+        # obscure the distinction between a normal finish and early unlock.
+        callback_time = self.observer.clock()
+        exited = self.root.exit_time()
+        if type(callback_time) is not int or exited is None or exited > callback_time:
+            raise ValueError(f"MO2 finished before the pinned {self.subject} exited")
+        if self.root.exit_code() != (exit_code & 0xffffffff):
+            raise ValueError(f"MO2 finish did not match the pinned {self.subject} exit code")
+        self.finished_at = callback_time
+        self.exit_evidence = {"pid": self.root.pid, "created": self.root.created,
+                              "executable": self.root.executable, "exited": exited,
+                              "exit_code": exit_code}
+
+
 class RunningApplications:
     def __init__(self, observer=None, *, on_skse_event=None, mo2_version=None):
         self._on_skse_event = on_skse_event
@@ -721,6 +859,8 @@ class RunningApplications:
         self.manual = set()
         self.managed_game = None
         self._skse_launches = {}
+        self._direct_launches = {}
+        self._generic_sequences_unsupported = False
         self.records = {}
         self.global_uncertainty = None
         self._last_poll = 0.0
@@ -731,6 +871,10 @@ class RunningApplications:
             self.observer_error = f"{type(error).__name__}: {error}"
         self._steam_bootstrap = (SteamBootstrap(self.observer)
                                  if self.observer is not None and mo2_version == "2.5.2" else None)
+        self._native_direct_tracking = (mo2_version == "2.5.2"
+            and type(getattr(self.observer, "owner_pid", None)) is int
+            and all(callable(getattr(self.observer, name, None))
+                    for name in ("identities", "snapshot", "clock", "pin", "pinned_sequence")))
 
     def add(self, value):
         self.manual.add(str(value))
@@ -790,7 +934,43 @@ class RunningApplications:
                     reason = "A new SKSE start arrived while the previous launch was still unresolved"
                 self._reject_skse(skse, record, reason)
                 self._skse_event("additional_start", record, pending_before=previous_pending)
+        elif (self._native_direct_tracking and ntpath.basename(key) != "skse64_loader.exe"
+                and key.endswith(".exe")
+                and self._start_direct(key, record, fresh)):
+            return
         self._observe(key, record)
+
+    def _start_direct(self, key, record, fresh):
+        command_wrapper = ntpath.basename(key) == "cmd.exe"
+        if not fresh:
+            launch = self._direct_launches.get(key)
+            if launch is None:
+                return False
+            self._reject_direct(launch, record,
+                                f"A new {launch.subject} launch arrived while an earlier one was unresolved")
+            return True
+        if not command_wrapper and self._generic_sequences_unsupported:
+            return False
+        launch = _DirectLaunch(self.observer, key)
+        error = None
+        try:
+            launch.start()
+        except Exception as failure:
+            # Preserve the legacy guard on Windows builds that lack this kernel query.
+            # Other observation errors, and any lost proof after start, remain blocking.
+            if not command_wrapper and isinstance(failure, _ProcessSequencesUnsupported):
+                self._generic_sequences_unsupported = True
+                return False
+            error = f"{type(failure).__name__}: {failure}"
+
+        self._direct_launches[key] = launch
+        record.update(tracking="command_wrapper" if command_wrapper else "direct_tool",
+                      completion_state="tracking", last_observed_processes=[],
+                      callback_exit_evidence=[], completion_survivor_count=0,
+                      completion_survivor_details=[])
+        if error is not None:
+            self._reject_direct(launch, record, error, observation=True)
+        return True
 
     def finished(self, executable, exit_code=None):
         try:
@@ -805,6 +985,10 @@ class RunningApplications:
         if skse is not None:
             self._finish_skse(key, record, skse, exit_code)
             return
+        launch = self._direct_launches.get(key)
+        if launch is not None:
+            self._finish_direct(key, record, launch, exit_code)
+            return
         self._observe(key, record)
         if record["pending_attempts"]:
             record["pending_attempts"] -= 1
@@ -815,6 +999,56 @@ class RunningApplications:
                 or type(exit_code) is not int or exit_code in {259, -1, 0xffffffff}):
             record["finish_uncertainty"] = "MO2 finish did not establish observable process/tree completion; restart after closing tools"
         self._discard_closed(key, record)
+
+    def _finish_direct(self, key, record, launch, exit_code):
+        pending = record["pending_attempts"]
+        if pending:
+            record["pending_attempts"] -= 1
+        if launch.problem is None:
+            try:
+                if pending != 1:
+                    raise ValueError(f"MO2 finish did not match one pending {launch.subject} launch")
+                launch.confirm_finish(exit_code)
+                record["callback_exit_evidence"] = [launch.exit_evidence]
+                record["completion_state"] = "checking_survivors"
+                self._observe_direct(launch, record)
+            except Exception as error:
+                self._reject_direct(launch, record, str(error))
+        self._discard_closed(key, record)
+
+    @staticmethod
+    def _reject_direct(launch, record, reason, *, observation=False):
+        if launch.problem is not None:
+            return
+        launch.problem = reason
+        launch.close()
+        record["instances"] = []
+        if observation:
+            record["observation_error"] = reason
+        record["tree_uncertainty"] = True
+        record["finish_uncertainty"] = reason + "; restart after closing tools"
+        record["completion_state"] = "restart_required"
+
+    def _observe_direct(self, launch, record):
+        try:
+            instances, evidence, survivors = launch.observe()
+        except Exception as error:
+            self._reject_direct(launch, record, f"{type(error).__name__}: {error}", observation=True)
+            return
+        record["instances"] = instances
+        record["last_observed_processes"] = evidence
+        record["observed_after_launch"] = bool(evidence)
+        record["baseline_process_count"] = len(launch.lineage.baseline)
+        record["tree_uncertainty"] = bool(survivors)
+        record["completion_survivor_count"] = len(survivors)
+        if survivors:
+            record["completion_survivor_details"] = launch.lineage.survivor_details(sorted(survivors)[:16])
+        else:
+            record["completion_survivor_details"] = []
+        if launch.finished_at is not None:
+            record["completion_state"] = "checking_survivors" if survivors else "verified"
+            record["finish_uncertainty"] = ("Waiting for observed descendants or unresolved launch ancestry"
+                                            if survivors else None)
 
     def _finish_skse(self, key, record, skse, exit_code):
         previous_pending = record["pending_attempts"]
@@ -906,11 +1140,17 @@ class RunningApplications:
             skse = self._skse_launches.pop(key, None)
             if skse is not None:
                 skse.close()
+            launch = self._direct_launches.pop(key, None)
+            if launch is not None:
+                launch.close()
 
     def poll(self):
         now = time.monotonic()
-        interval = .1 if any(now < launch.rapid_until and not launch.paired and not launch.problem
-                              for launch in self._skse_launches.values()) else .5
+        rapid_skse = any(now < launch.rapid_until and not launch.paired and not launch.problem
+                         for launch in self._skse_launches.values())
+        rapid_direct = any(now < launch.rapid_until and launch.root is None and not launch.problem
+                           for launch in self._direct_launches.values())
+        interval = .1 if rapid_skse or rapid_direct else .5
         if now - self._last_poll < interval:
             return
         self._last_poll = now
@@ -923,6 +1163,11 @@ class RunningApplications:
         if skse is not None:
             if skse.problem is None:
                 self._observe_skse(skse, record)
+            return
+        launch = self._direct_launches.get(key)
+        if launch is not None:
+            if launch.problem is None:
+                self._observe_direct(launch, record)
             return
         try:
             if self.observer is None:
@@ -1004,6 +1249,10 @@ class RunningApplications:
                 "cancellation_observable": False, "arbitrary_descendant_tree_certified": False,
                 "skse_tracking": "standard managed Skyrim SE loader and directly launched game; "
                                  "require verified exits and check only launch-linked survivor generations",
+                "command_wrapper_tracking": "MO2 2.5.2 direct cmd.exe launch with exact Windows "
+                                            "identity, matching exit callback and observed descendants",
+                "direct_tool_tracking": "MO2 2.5.2 direct executable with exact Windows identity, "
+                                        "matching exit callback and observed descendants",
                 "unconfirmed_policy": "block changes; no time-based expiry or guessed cancellation",
                 "restart_required_for_unobservable_canceled_launch": True,
                 "uncertainty": self.global_uncertainty,

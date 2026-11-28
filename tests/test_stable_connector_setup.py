@@ -109,7 +109,7 @@ class StableConnectorTests(unittest.TestCase):
         self.assertEqual(new_settings['mcpServers']['mo2_bridge'], generated['mcpServers']['mo2_bridge'])
         self.assertEqual(new_settings['mcpServers']['another'], {'command': 'preserve-me'})
 
-    def test_exact_installed_zipapp_advertises_all_nexus_actions(self):
+    def test_exact_installed_zipapp_advertises_download_and_preview_actions(self):
         self.install()
         request = '\n'.join([
             json.dumps(dict(jsonrpc='2.0', id=1, method='initialize', params={})),
@@ -123,7 +123,8 @@ class StableConnectorTests(unittest.TestCase):
         init, listed = map(json.loads, reply.stdout.splitlines())
         self.assertEqual(init['result']['serverInfo']['version'], setup.VERSION)
         schemas = {tool['name']: tool['inputSchema'] for tool in listed['result']['tools']}
-        self.assertLessEqual({'nexus_files', 'nexus_download_status'},
+        self.assertLessEqual({'nexus_files', 'nexus_download_status', 'nexus_find_archive',
+                              'preview_optional_plugin', 'preview_mod_replacement'},
                              set(schemas['mo2_inspect']['properties']['action']['enum']))
         self.assertLessEqual({'nexus_download', 'nexus_download_retry'},
                              set(schemas['mo2_change']['properties']['action']['enum']))

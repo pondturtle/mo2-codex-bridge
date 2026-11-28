@@ -18,14 +18,16 @@ from .order_recovery import read_order_backup, build_restore_plan, revalidate_re
 from .mod_persistence import ModListPersistence
 from .native_backups import browse_native_mod_backups
 from .profile_usage import report_mod_profile_usage
+from .optional_plugin_preview import preview_optional_plugin
+from .replacement_preview import preview_mod_replacement
 from .mod_change_previews import ModChangePreviews
 from .mod_placement import build_placement
 from .mod_rename import build_rename
 
 READ_ACTIONS = {'status', 'snapshot', 'downloads', 'file_conflict', 'mod_conflicts',
                 'read_config', 'diagnostics', 'backups', 'logs', 'api_capabilities', 'profiles',
-                'native_mod_backups', 'mod_profile_usage', 'preview_mod_change',
-                'nexus_files', 'nexus_download_status'}
+                'native_mod_backups', 'mod_profile_usage', 'preview_mod_change', 'preview_optional_plugin', 'preview_mod_replacement',
+                'nexus_files', 'nexus_download_status', 'nexus_find_archive'}
 WRITE_ACTIONS = {'create_separator', 'set_mod_priority', 'set_mod_active', 'set_plugin_active',
                  'set_plugin_order', 'install_archive', 'update_archive', 'write_config',
                  'restore_config', 'hide_file', 'unhide_file', 'restore_order', 'remove_empty_separator',
@@ -194,6 +196,12 @@ class Operations:
     def preview_mod_change(self, p, b):
         return self.mod_previews.preview(p)
 
+    def preview_optional_plugin(self, p, b):
+        return preview_optional_plugin(self, p)
+
+    def preview_mod_replacement(self, p, b):
+        return preview_mod_replacement(self, p)
+
     def native_mod_backups(self, p, b):
         return browse_native_mod_backups(self.o, p)
 
@@ -228,6 +236,11 @@ class Operations:
         if self.nexus is None:
             raise ValueError('Nexus operations are unavailable in this MO2 session')
         return self.nexus.files(p)
+
+    def nexus_find_archive(self, p, b):
+        if self.nexus is None:
+            raise ValueError('Nexus operations are unavailable in this MO2 session')
+        return self.nexus.find_archive(p)
 
     def _nexus_download_change(self, operation, p, *, before_claim=None):
         if self.nexus is None:

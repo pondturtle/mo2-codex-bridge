@@ -1,6 +1,7 @@
 """Exact Nexus file selection, at-most-once handoff and offline archive proof."""
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -9,12 +10,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .common import contained_path
+from .common import atomic_write, contained_path
 from .nexus_archive import (
-    capture_archive_baseline, capture_retry_baseline, inspect_nexus_archive,
-    revalidate_verified_archive,
+    capture_archive_baseline, capture_retry_baseline, inspect_existing_nexus_archive, inspect_nexus_archive,
+    observe_nexus_transfer_start, revalidate_verified_archive,
 )
-from .nexus_catalog import fetch_public_files
+from .nexus_catalog import PublicCatalogBackoff, fetch_public_files
 from .nexus_links import NexusLink, managed_nexus_game, normalize_nexus_file, normalize_nexus_files, parse_nexus_link
 from .nexus_native import NexusNative
 
@@ -23,8 +24,12 @@ _LOOKUP_TIMEOUT = 40
 _LOOKUP_TTL = 300
 _MAX_LOOKUPS = 16
 _MAX_CHECKS = 8
+_MAX_EXISTING_CHECKS = 4
+_EXISTING_MAX_RESULT_AGE = 60
 _MAX_RECEIPT = 4 * 1024 * 1024
 _DOWNLOAD_ID = re.compile(r"[a-f0-9]{64}")
+_NATIVE_START_INTERVAL = 5
+_START_OBSERVATION_TTL = 5
 
 
 def _identity(game, mod_id, file_id):
@@ -49,8 +54,12 @@ class NexusDownloads:
         self.executor = (ThreadPoolExecutor(max_workers=2, thread_name_prefix="mo2-nexus")
                          if executor is None else executor)
         self.clock = clock
+        self.started_at = self.clock()
+        self.pacing = None
+        self.public_backoff_until = 0
         self.lookups = {}
         self.checks = {}
+        self.existing_checks = {}
         self.cancelled = threading.Event()
 
     def close(self):
@@ -60,6 +69,7 @@ class NexusDownloads:
             if cancel is not None:
                 cancel()
         self.lookups.clear()
+        self.existing_checks.clear()
         self.executor.shutdown(wait=False, cancel_futures=True)
 
     def _link(self, params, keys):
@@ -166,6 +176,7 @@ class NexusDownloads:
     def _lookup(self, link):
         now = self.clock()
         for key, item in list(self.lookups.items()):
+            self._poll_catalog(item, now)
             if now < item["expires"]:
                 continue
             if item.get("future") is not None:
@@ -176,7 +187,11 @@ class NexusDownloads:
         key = (link.game, link.mod_id, link.file_id)
         item = self.lookups.get(key)
         if item is not None:
-            return self._poll_catalog(item, now)
+            return item
+        if link.file_id is None:
+            cooled = self._public_backoff(now)
+            if cooled is not None:
+                return cooled
         if len(self.lookups) >= _MAX_LOOKUPS:
             previous = next((cached for cached, entry in self.lookups.items()
                              if entry["status"] != "pending" or
@@ -211,8 +226,14 @@ class NexusDownloads:
             failed()
         return self._poll_catalog(item, now)
 
-    @staticmethod
-    def _poll_catalog(item, now):
+    def _public_backoff(self, now):
+        remaining = self.public_backoff_until - now
+        if remaining > 0:
+            return {"status": "rate_limited", "retry_after_seconds": math.ceil(remaining),
+                    "message": "Nexus requested a pause before another public catalog request."}
+        return None
+
+    def _poll_catalog(self, item, now):
         future = item.get("future")
         if future is None or not future.done():
             return item
@@ -220,6 +241,14 @@ class NexusDownloads:
         try:
             data = normalize_nexus_files(future.result())
             item.update(status="available", data=data, expires=now + _LOOKUP_TTL)
+        except PublicCatalogBackoff as delay:
+            self.public_backoff_until = max(self.public_backoff_until, now + delay.retry_after_seconds)
+            cooled = self._public_backoff(now)
+            if cooled is None:
+                item.update(status="unavailable", message="Nexus did not return a public file catalog.",
+                            expires=now + _LOOKUP_TIMEOUT)
+            else:
+                item.update(cooled, expires=self.public_backoff_until)
         except Exception:
             item.update(status="unavailable",
                         message="Public Nexus file metadata is unavailable. Use the Nexus Files page.",
@@ -238,6 +267,9 @@ class NexusDownloads:
                   "file_id": link.file_id, "files_url": link.files_url}
         if "message" in info:
             result["message"] = info["message"]
+        if info["status"] == "rate_limited":
+            result.update(self._public_backoff(self.clock()) or
+                          {"status": "unavailable", "message": "Repeat the catalog request to try again."})
         if info["status"] == "available":
             data = info["data"]
             if "files" in data:
@@ -248,6 +280,46 @@ class NexusDownloads:
             else:
                 result["file"] = dict(data["file"], url=link.file_page(link.file_id))
         return result
+
+    def find_archive(self, params):
+        link = self._link(params, {"url", "file_id"})
+        if link.file_id is None:
+            raise ValueError("An exact Nexus file ID is required")
+        game, short, root = self._scope()
+        if (game, short) != (link.game, link.game_short) or not Path(root).is_absolute():
+            raise ValueError("The current MO2 game or Downloads path could not be verified")
+        target = {"game": game, "game_short": short, "mod_id": link.mod_id, "file_id": link.file_id}
+        public = {"game": game, "mod_id": link.mod_id, "file_id": link.file_id}
+        key = (root, link)
+        future = self.existing_checks.get(key)
+        if future is not None and future.done():
+            del self.existing_checks[key]
+            try:
+                baseline, result, observed_at = future.result()
+            except Exception:
+                return dict(public, status="unverified", message="The existing-archive check could not be completed.")
+            if not 0 <= self.clock() - observed_at <= _EXISTING_MAX_RESULT_AGE:
+                return dict(public, status="unverified", message="The observation expired. Repeat the exact lookup.")
+            if result["status"] != "verified":
+                return dict(public, **{name: value for name, value in result.items() if not name.startswith("_")})
+            if not revalidate_verified_archive(root, target, baseline, result):
+                return dict(public, status="unverified",
+                            message="Archive evidence changed during the check. Repeat the exact lookup.")
+            return dict(public, status="verified", archive=dict(result["archive"]),
+                        evidence="Matching local MO2 Nexus metadata and SHA-256 of the local archive")
+
+        if future is None:
+            if len(self.existing_checks) >= _MAX_EXISTING_CHECKS:
+                done = next((k for k, work in self.existing_checks.items() if work.done()), None)
+                if done is None:
+                    return dict(public, status="busy", message="Existing-archive checks are busy. Check again later.")
+                del self.existing_checks[done]
+            self.existing_checks[key] = self.executor.submit(self._observe_existing_archive, root, target)
+        return dict(public, status="checking_archive", message="Checking this exact file in MO2 Downloads.")
+
+    def _observe_existing_archive(self, root, target):
+        baseline, result = inspect_existing_nexus_archive(root, target, cancelled=self.cancelled.is_set)
+        return baseline, result, self.clock()
 
     @staticmethod
     def _public(record):
@@ -282,6 +354,9 @@ class NexusDownloads:
 
     def _premium_info(self, link):
         catalog = self._lookup(NexusLink(link.game, link.mod_id, None, link.game_short))
+        cooled = self._public_backoff(self.clock())
+        if cooled is not None:
+            return cooled
         info = self._lookup(link)
         if "pending" in (catalog["status"], info["status"]):
             return None
@@ -301,7 +376,121 @@ class NexusDownloads:
             raise ValueError("Nexus metadata disagrees on the exact file size. Refresh its Files page.")
         return {"size_bytes": next(iter(sizes), None), "expected_name": file_info.get("file_name")}
 
-    def _claim_and_submit(self, record, scope, native_call, *, ready=None, before_claim=None):
+    def _pacing_path(self):
+        directory = self.store.parent
+        if directory.is_symlink() or directory.is_junction():
+            raise ValueError("Linked Nexus download data directory refused")
+        return contained_path(directory, "nexus-native-start.json")
+
+    def _pacing_marker(self):
+        path = self._pacing_path()
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(129)
+        except FileNotFoundError:
+            return None
+        try:
+            value = json.loads(raw)
+            if (len(raw) > 128 or not isinstance(value, dict) or set(value) != {"download_id"}
+                    or not isinstance(value["download_id"], str) or not _DOWNLOAD_ID.fullmatch(value["download_id"])):
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("The previous automatic Nexus start record is unreadable. Inspect MO2 Downloads.") from None
+        return value["download_id"]
+
+    def _load_pacing(self, scope):
+        previous = self._pacing_marker()
+        if previous is None:
+            if self.pacing is not None:
+                raise ValueError("The previous automatic Nexus start record changed. Inspect MO2 Downloads.")
+            return None
+        if self.pacing is None or self.pacing["record"]["download_id"] != previous:
+            record = self._read(previous)
+            if record is None or record["mode"] != "premium" or record["baseline"].get("existing"):
+                raise ValueError("The previous automatic Nexus start receipt could not be verified.")
+            self._ensure_scope(record, *scope)
+            self.pacing = {"record": record, "submitted": self.started_at}
+        self._ensure_scope(self.pacing["record"], *scope)
+        return self.pacing
+
+    def _record_native_start(self, record, expected_previous):
+        path = self._pacing_path()
+
+        def still_current():
+            if self._pacing_marker() != expected_previous:
+                raise ValueError("The preceding automatic download changed before submitting.")
+
+        raw = json.dumps({"download_id": record["download_id"]}).encode("ascii")
+        atomic_write(path, raw, before_replace=still_current)
+        self.pacing = {"record": record, "submitted": self.clock()}
+
+    def _observe_preceding_start(self, record):
+        confirmed = observe_nexus_transfer_start(record["downloads_root"], record["target"], record["baseline"],
+                                                 cancelled=self.cancelled.is_set)
+        return confirmed, self.clock()
+
+    def _confirmed_absence_still_holds(self, state):
+        record = state["record"]
+        if not self._queue_idle(record["target"]["game"]):
+            return False
+        try:
+            current = capture_retry_baseline(record["downloads_root"], record["target"], record["baseline"],
+                                             expected_name=record.get("expected_name"))
+            return current == state["absent"] and self._queue_idle(record["target"]["game"])
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    def _defer_native_start(self, state, *, retry_of):
+        if state is None:
+            return None
+        now = self.clock()
+        record = state["record"]
+        previous = record["download_id"]
+        # An approved retry already proved exact absence and an idle queue.
+        # A status-proven failure allows a subsequent, separately requested start.
+        due = state.get("confirmed", state["submitted"]) + _NATIVE_START_INTERVAL
+        if now >= due:
+            if retry_of == previous or ("absent" in state and self._confirmed_absence_still_holds(state)):
+                return None
+            state.pop("absent", None)
+        if now < due and (retry_of == previous or "absent" in state or "confirmed" in state):
+            return {"status": "download_paced", "previous_download_id": previous,
+                    "retry_after_seconds": math.ceil(due - now),
+                    "message": "Wait for the download start interval, then repeat the exact approved request."}
+
+        future = state.get("future")
+        if future is not None and future.done():
+            del state["future"]
+            try:
+                started, observed = future.result()
+                fresh = started and 0 <= now - observed <= _START_OBSERVATION_TTL
+            except Exception:
+                fresh = False
+            if fresh:
+                if "confirmed" in state:
+                    return None
+                state["confirmed"] = now
+                return {"status": "download_paced", "previous_download_id": previous,
+                        "retry_after_seconds": _NATIVE_START_INTERVAL,
+                        "message": "The previous transfer started. Wait before repeating the exact approved request."}
+            state.pop("confirmed", None)
+            future = None
+        if future is None:
+            try:
+                state["future"] = self.executor.submit(self._observe_preceding_start, record)
+            except RuntimeError:
+                pass  # The bridge is closing or its worker is unavailable.
+        return {"status": "waiting_for_previous_download", "previous_download_id": previous,
+                "message": "The previous exact transfer has not been confirmed. Check its download ID. "
+                           "No new download was submitted."}
+
+    def _claim_and_submit(self, record, scope, native_call, *, ready=None, before_claim=None, retry_of=None):
+        previous = None
+        if native_call is not None:
+            previous = self._load_pacing(scope)
+            deferred = self._defer_native_start(previous, retry_of=retry_of)
+            if deferred is not None:
+                return deferred
         if before_claim is not None:
             before_claim()
         if not self._reserve(record):
@@ -317,6 +506,14 @@ class NexusDownloads:
                           message="MO2's queue or Downloads directory changed after reserving this attempt. Check this new ID before taking action.")
             return result
         if native_call is not None:
+            expected = None if previous is None else previous["record"]["download_id"]
+            try:
+                self._record_native_start(record, expected)
+            except (OSError, ValueError, RuntimeError):
+                result.update(status="submission_blocked",
+                              message="The start interval record could not be saved. "
+                                      "This request was not submitted. Check the reserved ID.")
+                return result
             try:
                 native_call()
             except Exception:
@@ -347,6 +544,8 @@ class NexusDownloads:
             if info is None:
                 return {"status": "file_lookup_pending", "download_id": download_id,
                         "message": "Nexus file eligibility is being checked. Repeat this exact request once metadata arrives."}
+            if info.get("status") == "rate_limited":
+                return info
             if info["size_bytes"] is not None:
                 target["size_bytes"] = info["size_bytes"]
             expected_name = info["expected_name"]
@@ -390,6 +589,8 @@ class NexusDownloads:
             if info is None:
                 return {"status": "file_lookup_pending", "download_id": prior["download_id"],
                         "message": "Nexus metadata is being checked. Repeat the retry with the same original ID once it arrives."}
+            if info.get("status") == "rate_limited":
+                return info
             size = info["size_bytes"]
             name = info["expected_name"] or name
             if size is not None:
@@ -417,7 +618,8 @@ class NexusDownloads:
             except (OSError, ValueError, RuntimeError):
                 return False
 
-        return self._claim_and_submit(record, scope, native_call, ready=ready, before_claim=before_claim)
+        return self._claim_and_submit(record, scope, native_call, ready=ready, before_claim=before_claim,
+                                      retry_of=prior["download_id"])
 
     @staticmethod
     def _ensure_scope(record, game, short_name, root):
@@ -463,6 +665,8 @@ class NexusDownloads:
                 except (OSError, ValueError, RuntimeError):
                     same_directory = False
                 if same_directory:
+                    if self.pacing is not None and self.pacing["record"]["download_id"] == download_id:
+                        self.pacing["absent"] = current
                     evidence = {
                         "status": "no_archive",
                         "message": "The MO2 download queue is idle and no archive or partial file matches this request. An explicit retry can recheck eligibility.",

@@ -1,4 +1,5 @@
 """Offline workflow tests using a disposable MO2 model and native sidecars."""
+import hashlib
 import json
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+from mo2_codex_bridge.nexus_catalog import PublicCatalogBackoff
 from mo2_codex_bridge.nexus_downloads import NexusDownloads
 from mo2_codex_bridge.operations import Operations, READ_ACTIONS, WRITE_ACTIONS
 from client import MUTATING_ACTIONS
@@ -89,12 +91,15 @@ class DownloadsFixture(TestCase):
         self.downloads = Path(self.organizer.downloadsPath())
         self.data = self.root / "data"
         self.native = FakeNative()
+        self.now = 100.0
         self.bridge = self.open_bridge()
 
     def open_bridge(self, **kwargs):
         native = kwargs.pop("native", self.native)
+        catalog = kwargs.pop("catalog", lambda game, mod: CATALOG)
+        kwargs.setdefault("clock", lambda: self.now)
         engine = NexusDownloads(self.organizer, self.data, native=native, executor=InlineExecutor(),
-                                catalog=lambda game, mod: CATALOG, **kwargs)
+                                catalog=catalog, **kwargs)
         self.addCleanup(engine.close)
         return engine
 
@@ -108,8 +113,10 @@ class DownloadsFixture(TestCase):
         self.assertEqual(engine.status(p)["status"], "checking_archive")
         return engine.status(p)
 
-    def retry(self, download_id, *, engine=None, revalidate=lambda: None):
+    def retry(self, download_id, *, engine=None, revalidate=lambda: None, wait=True):
         conn = self.bridge if engine is None else engine
+        if wait:
+            self.now += 5
         return conn.retry({"download_id": download_id, "expected_profile": "Test",
                            "expected_revision": "current"}, revalidate=revalidate)
 
@@ -121,6 +128,106 @@ class DownloadsFixture(TestCase):
             f"paused={'true' if incomplete else 'false'}\nremoved=false\n"
             "url=private-url-that-must-never-leave-metadata\n", encoding="utf-8")
         return target
+
+    def test_find_exact_existing_archive_through_inspect_without_nexus_or_writes(self):
+        self.make_download("Fixture 1.7z", file_id=41)
+        selected = self.make_download("Fixture 2.7z")
+        self.make_download("Fixture 2 for another game.7z", game="Skyrim")
+        self.bridge.catalog = lambda *_: self.fail("Local lookup contacted the public catalog")
+        ops = Operations(self.organizer, None, self.data, None)
+        ops.nexus = self.bridge
+        ops.running = {"SkyrimSE.exe"}
+        client = SimpleNamespace(call=lambda action, params, timeout: ops.dispatch(action, params))
+        request = {"method": "tools/call", "params": {"name": "mo2_inspect", "arguments": {
+            "action": "nexus_find_archive", "params": {"url": FILE_URL}}}}
+        first = mcp_dispatch(request, client)
+        self.assertEqual(json.loads(first["content"][0]["text"])["status"], "checking_archive")
+        response = mcp_dispatch(request, client)
+        self.assertFalse(response["isError"])
+        evidence = json.loads(response["content"][0]["text"])
+        self.assertEqual(evidence["status"], "verified")
+        self.assertEqual(evidence["file_id"], 42)
+        self.assertEqual(evidence["archive"], {
+            "name": selected.name, "path": str(selected), "bytes": 7,
+            "sha256": hashlib.sha256(b"archive").hexdigest(),
+        })
+        self.assertNotIn("download_id", evidence)
+        self.assertNotIn("private-url", json.dumps(evidence))
+        self.assertFalse(self.bridge.store.exists())
+        self.assertEqual(self.native.requests + self.native.queued, [])
+
+    def test_find_ignores_filename_without_matching_sidecar(self):
+        (self.downloads / "Fixture-91-42.7z").write_bytes(b"archive")
+        params = {"url": MOD_URL, "file_id": 42}
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        result = self.bridge.find_archive(params)
+        self.assertEqual(result["status"], "not_found")
+        self.assertNotIn("archive", result)
+
+    def test_find_distinguishes_known_incomplete_and_duplicate_archives(self):
+        self.make_download("Partial.7z", incomplete=True)
+        params = {"url": FILE_URL}
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        result = self.bridge.find_archive(params)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertNotIn("archive", result)
+        self.make_download("Another.7z")
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        result = self.bridge.find_archive(params)
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertNotIn("archive", result)
+        self.assertFalse(self.bridge.store.exists())
+
+    def test_find_revalidates_archive_changed_between_worker_and_delivery(self):
+        selected = self.make_download("Fixture.7z")
+        params = {"url": FILE_URL}
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        selected.write_bytes(b"changed fixture data")
+        changed = self.bridge.find_archive(params)
+        self.assertEqual(changed["status"], "unverified")
+        self.assertNotIn("archive", changed)
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        checked = self.bridge.find_archive(params)
+        self.assertEqual(checked["archive"]["sha256"], hashlib.sha256(b"changed fixture data").hexdigest())
+
+    def test_find_rescans_competing_metadata_after_a_completed_lookup(self):
+        self.make_download("Exact.7z")
+        competing = self.make_download("Competing.7z", file_id=41)
+        params = {"url": FILE_URL}
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        self.assertEqual(self.bridge.find_archive(params)["status"], "verified")
+        sidecar = Path(str(competing) + ".meta")
+        sidecar.write_bytes(sidecar.read_bytes().replace(b"fileID=41", b"fileID=42"))
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        self.assertEqual(self.bridge.find_archive(params)["status"], "ambiguous")
+
+    def test_unpolled_existing_archive_observation_expires(self):
+        self.make_download("Exact.7z")
+        params = {"url": FILE_URL}
+        self.bridge.clock = lambda: 1
+        self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+        self.bridge.clock = lambda: 90
+        self.assertEqual(self.bridge.find_archive(params)["status"], "unverified")
+        self.assertFalse(self.bridge.existing_checks)
+
+    def test_find_bounded_pending_checks_use_one_job_per_exact_file(self):
+        with patch.object(self.bridge.executor, "submit", side_effect=lambda *a, **k: Future()) as submit:
+            for file_id in range(42, 46):
+                params = {"url": MOD_URL, "file_id": file_id}
+                self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+                self.assertEqual(self.bridge.find_archive(params)["status"], "checking_archive")
+            self.assertEqual(self.bridge.find_archive({"url": MOD_URL, "file_id": 46})["status"], "busy")
+            self.assertEqual(submit.call_count, 4)
+
+    def test_find_refuses_inexact_conflicting_and_wrong_game_targets(self):
+        for params in (
+            {"url": MOD_URL}, {"url": FILE_URL, "file_id": 41},
+            {"url": FILE_URL.replace("skyrimspecialedition", "skyrim")},
+            {"url": FILE_URL, "download_id": "irrelevant"},
+        ):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                self.bridge.find_archive(params)
+        self.assertEqual(self.bridge.existing_checks, {})
 
     def test_public_catalog_pages_and_consistent_exact_links(self):
         first = self.bridge.files({"url": MOD_URL, "limit": 1})
@@ -511,6 +618,7 @@ class DownloadsFixture(TestCase):
             ops.dispatch("nexus_download_retry", params)
         params["expected_profile"] = "Test"
         client = SimpleNamespace(call=lambda action, params, timeout: ops.dispatch(action, params))
+        self.now += 5
         result = mcp_dispatch({"method": "tools/call", "params": {"name": "mo2_change", "arguments": {
             "action": "nexus_download_retry", "params": params,
         }}}, client)
@@ -568,6 +676,7 @@ class DownloadsFixture(TestCase):
 
         with patch.object(self.bridge, "_reserve", side_effect=uncertain_claim):
             with self.assertRaisesRegex(OSError, "after reservation") as error:
+                self.now += 5
                 ops.dispatch("nexus_download_retry", {"download_id": original["download_id"],
                     "expected_profile": "Test", "expected_revision": ops.snapshot()["revision"]})
         failure = error.exception.bridge_failure
@@ -576,3 +685,145 @@ class DownloadsFixture(TestCase):
         self.assertEqual(failure["observed_state"]["profile"], "Test")
         self.assertIsNotNone(self.bridge._successor(self.bridge._read(original["download_id"])))
         self.assertEqual(len(self.native.queued), 1)
+
+    def test_chat_clients_share_pacing_and_transfer_can_overlap(self):
+        ops = Operations(self.organizer, SimpleNamespace(ModState=ModState, PluginState=PluginState),
+                         self.data, lambda: None)
+        ops.nexus = self.bridge
+        first_client, second_client = [SimpleNamespace(call=lambda action, params, timeout: ops.dispatch(action, params))
+                                       for _ in range(2)]
+        revision = ops.snapshot()["revision"]
+
+        def premium(client, url):
+            response = mcp_dispatch({"method": "tools/call", "params": {"name": "mo2_change", "arguments": {
+                "action": "nexus_download", "params": {"url": url, "mode": "premium",
+                    "expected_profile": "Test", "expected_revision": revision}}}}, client)
+            self.assertFalse(response["isError"], response)
+            return json.loads(response["content"][0]["text"])
+
+        second_url = FILE_URL.replace("file_id=42", "file_id=43")
+        first = premium(first_client, FILE_URL)
+        self.assertEqual(first["status"], "tracking_native_request")
+        self.assertEqual(premium(second_client, FILE_URL)["download_id"], first["download_id"])
+        self.native.category = 3
+        part = self.make_download("active.zip", incomplete=True)
+        Path(str(part) + ".meta").write_bytes(Path(str(part) + ".meta").read_bytes().replace(b"paused=true", b"paused=false"))
+        self.assertEqual(premium(second_client, second_url)["status"], "waiting_for_previous_download")
+        wait = premium(second_client, second_url)
+        self.assertEqual((wait["status"], wait["retry_after_seconds"]), ("download_paced", 5))
+        self.now += 4.999
+        wait = premium(first_client, second_url)
+        self.assertEqual((wait["status"], wait["retry_after_seconds"]), ("download_paced", 1))
+        self.assertEqual(wait["previous_download_id"], first["download_id"])
+        self.assertNotIn("download_id", wait)
+        self.assertEqual(len(list(self.bridge.store.glob("*.json"))), 1)
+        self.assertEqual(len(self.native.queued), 1)
+        self.now = 105.0
+        self.assertEqual(premium(second_client, second_url)["status"], "waiting_for_previous_download")
+        self.assertEqual(premium(second_client, second_url)["status"], "tracking_native_request")
+        self.assertEqual([item[2] for item in self.native.queued], [42, 43])
+        self.assertTrue(part.is_file())
+        self.assertFalse((self.data / "backups").exists())
+
+    def test_uncertain_start_remains_gated_past_gap_and_restart(self):
+        self.native.crash = True
+        original = self.start(mode="premium")
+        self.assertEqual(original["status"], "submission_uncertain")
+        self.native.category = 3
+        self.now += 20
+        reopened = self.open_bridge()
+        for _ in range(3):
+            waiting = self.start(mode="premium", url=FILE_URL.replace("file_id=42", "file_id=43"), bridge=reopened)
+            self.assertEqual(waiting["status"], "waiting_for_previous_download")
+            self.assertEqual(waiting["previous_download_id"], original["download_id"])
+            self.assertNotIn("download_id", waiting)
+        self.assertEqual(len(list(reopened.store.glob("*.json"))), 1)
+        self.assertEqual(len(self.native.queued), 1)
+
+    def test_explicit_retry_of_preceding_failure_respects_gap(self):
+        original = self.start(mode="premium")["download_id"]
+        self.assertEqual(self.status(original)["status"], "no_archive")
+        waiting = self.retry(original, wait=False)
+        self.assertEqual((waiting["status"], waiting["retry_after_seconds"]), ("download_paced", 5))
+        self.assertEqual(len(self.native.queued), 1)
+        self.assertIsNone(self.bridge._successor(self.bridge._read(original)))
+        self.now += 5
+        self.assertEqual(self.retry(original, wait=False)["status"], "tracking_native_request")
+        self.assertEqual(len(self.native.queued), 2)
+
+    def test_no_archive_status_resolves_gate_for_separately_requested_new_file(self):
+        original = self.start(mode="premium")["download_id"]
+        self.native.category = 3
+        url = FILE_URL.replace("file_id=42", "file_id=43")
+        self.now += 6
+        self.assertEqual(self.start(mode="premium", url=url)["status"], "waiting_for_previous_download")
+        self.assertEqual(self.status(original)["status"], "no_archive")
+        self.assertEqual(self.start(mode="premium", url=url)["status"], "tracking_native_request")
+        self.assertEqual([item[2] for item in self.native.queued], [42, 43])
+
+    def test_prior_partial_paused_after_first_proof_stops_second_start(self):
+        original = self.start(mode="premium")["download_id"]
+        part = self.make_download("active.zip", incomplete=True)
+        sidecar = Path(str(part) + ".meta")
+        active = sidecar.read_bytes().replace(b"paused=true", b"paused=false")
+        sidecar.write_bytes(active)
+        self.native.category = 3
+        url = FILE_URL.replace("file_id=42", "file_id=43")
+        self.assertEqual(self.start(mode="premium", url=url)["status"], "waiting_for_previous_download")
+        self.assertEqual(self.start(mode="premium", url=url)["status"], "download_paced")
+        self.now += 10
+        sidecar.write_bytes(active.replace(b"paused=false", b"paused=true"))
+        for _ in range(2):
+            wait = self.start(mode="premium", url=url)
+            self.assertEqual((wait["status"], wait["previous_download_id"]), ("waiting_for_previous_download", original))
+        self.assertEqual(len(self.native.queued), 1)
+
+    def test_manual_and_duplicates_work_while_automatic_start_waits(self):
+        original = self.start(mode="premium")["download_id"]
+        self.assertEqual(self.start(mode="premium")["download_id"], original)
+        manual = self.start(url=FILE_URL.replace("file_id=42", "file_id=43"))
+        self.assertEqual(manual["status"], "awaiting_browser")
+        self.assertEqual(self.bridge._pacing_marker(), original)
+        self.assertEqual(len(self.native.queued), 1)
+
+    def test_corrupted_predecessor_marker_refuses_new_automatic_starts(self):
+        previous = self.start(mode="premium")["download_id"]
+        self.bridge._pacing_path().write_bytes(b"malformed pacing fixture")
+        reopened = self.open_bridge()
+        self.native.category = 3
+        with self.assertRaisesRegex(ValueError, "previous automatic Nexus start record is unreadable"):
+            self.start(mode="premium", url=FILE_URL.replace("file_id=42", "file_id=43"), bridge=reopened)
+        self.assertEqual(self.start(mode="premium", bridge=reopened)["download_id"], previous)
+        self.assertEqual(len(self.native.queued), 1)
+        self.assertEqual(len(list(reopened.store.glob("*.json"))), 1)
+
+    def test_pacing_record_write_failure_never_submits_native_handoff(self):
+        with patch.object(self.bridge, "_record_native_start", side_effect=OSError("fixture")):
+            result = self.start(mode="premium")
+        self.assertEqual(result["status"], "submission_blocked")
+        self.assertEqual(self.start(mode="premium")["download_id"], result["download_id"])
+        self.assertFalse(self.native.queued)
+
+    def test_public_retry_after_holds_distinct_catalog_calls_and_premium_starts(self):
+        calls = []
+
+        def catalog(game, mod):
+            calls.append(mod)
+            if len(calls) == 1:
+                raise PublicCatalogBackoff(20)
+            return CATALOG
+
+        bridge = self.open_bridge(catalog=catalog)
+        first = self.start(mode="premium", bridge=bridge)
+        self.assertEqual((first["status"], first["retry_after_seconds"]), ("rate_limited", 20))
+        self.assertFalse(bridge.store.exists())
+        self.assertFalse(self.native.requests)
+        self.now += 17
+        other_url = FILE_URL.replace("/91?", "/92?")
+        result = bridge.files({"url": other_url.split("?")[0]})
+        self.assertEqual((result["status"], result["retry_after_seconds"]), ("rate_limited", 3))
+        self.assertEqual(calls, [91])
+        self.now += 3
+        self.assertEqual(self.start(mode="premium", bridge=bridge)["status"], "tracking_native_request")
+        self.assertEqual(calls, [91, 91])
+
